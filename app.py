@@ -12,6 +12,8 @@ import pandas as pd
 import numpy as np
 import json
 import time
+import io
+import zipfile
 from typing import Dict, List, Optional
 
 # Import our modules
@@ -23,10 +25,14 @@ from visuals import LogisticsVisualizer
 from utils import ETAPredictor, ScenarioGenerator, calculate_kpis, format_currency
 
 # Initialize Dash app
-app = dash.Dash(__name__, external_stylesheets=[
-    dbc.themes.BOOTSTRAP,
-    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
-])
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[
+        dbc.themes.BOOTSTRAP,
+        "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
+    ],
+    suppress_callback_exceptions=True
+)
 
 app.title = "SIH Logistics Optimization Simulator"
 
@@ -38,6 +44,62 @@ baseline_solution = None
 
 # Initialize ETA predictor
 eta_predictor = ETAPredictor()
+
+def make_json_safe(value):
+    """Recursively convert numpy/pandas objects to JSON-safe Python types."""
+    if isinstance(value, dict):
+        return {key: make_json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, (np.integer, np.int64, np.int32)):
+        return int(value)
+    if isinstance(value, (np.floating, np.float64, np.float32)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, pd.DataFrame):
+        return value.to_dict("records")
+    if isinstance(value, (pd.Series, pd.Index)):
+        return value.tolist()
+    return value
+
+
+def get_data_frames(stored_data_json: Optional[str]) -> Dict[str, pd.DataFrame]:
+    """Reconstruct dataframes from stored JSON string."""
+    if not stored_data_json:
+        return {}
+    try:
+        raw = json.loads(stored_data_json)
+        return {key: pd.DataFrame(value) for key, value in raw.items()}
+    except Exception as exc:
+        print(f"Data reconstruction error: {exc}")
+        return {}
+
+
+def attach_solution_kpis(solution: Dict, data_frames: Dict[str, pd.DataFrame],
+                         simulation_results: Optional[Dict] = None) -> Dict:
+    """Compute and embed KPI metrics into the solution payload."""
+    try:
+        assignments = solution.get('assignments', [])
+        vessels_df = data_frames.get('vessels', pd.DataFrame())
+        plants_df = data_frames.get('plants', pd.DataFrame())
+        ports_df = data_frames.get('ports', pd.DataFrame())
+        rail_costs_df = data_frames.get('rail_costs', pd.DataFrame())
+
+        kpis = calculate_kpis(
+            assignments,
+            vessels_df,
+            plants_df,
+            simulation_results,
+            ports_df,
+            rail_costs_df
+        )
+        solution['kpis'] = kpis
+    except Exception as exc:
+        print(f"Solution KPI attachment error: {exc}")
+    return solution
 
 def create_header():
     """Create application header"""
@@ -474,6 +536,13 @@ app.layout = dbc.Container([
     html.Div(id="stored-data", style={"display": "none"}),
     html.Div(id="stored-solution", style={"display": "none"}),
     html.Div(id="stored-simulation", style={"display": "none"}),
+
+    # Download targets (kept global so buttons work from any tab)
+    dcc.Download(id="download-dispatch-csv-file"),
+    dcc.Download(id="download-sap-file"),
+    dcc.Download(id="download-full-report-file"),
+    dcc.Download(id="download-gantt-csv"),
+    dcc.Download(id="sample-csv-download"),
     
     # Interval component for progress updates
     dcc.Interval(id="progress-interval", interval=1000, n_intervals=0, disabled=True)
@@ -668,9 +737,6 @@ def create_logs_tab():
                             dbc.Button([html.I(className="fas fa-file-pdf me-2"), "Full Report"], 
                                       id="download-full-report", color="info", className="mb-2")
                         ], vertical=True, className="w-100"),
-                        dcc.Download(id="download-dispatch-csv-file"),
-                        dcc.Download(id="download-sap-file"),
-                        dcc.Download(id="download-full-report-file"),
                         html.Hr(),
                         html.H6("Export Preview:", className="mt-3"),
                         html.Div(id="export-preview")
@@ -734,7 +800,10 @@ def run_optimization(baseline_clicks, optimized_clicks, stored_data, opt_method,
             
             milp_optimizer = MILPOptimizer(data)
             solution = milp_optimizer.create_baseline_solution()
+            solution = attach_solution_kpis(solution, data)
+            solution = make_json_safe(solution)
             baseline_solution = solution
+            current_solution = solution
             
             status_msg = html.Div([
                 html.I(className="fas fa-check-circle me-2"),
@@ -786,6 +855,8 @@ def run_optimization(baseline_clicks, optimized_clicks, stored_data, opt_method,
                     ga_solution, max_iterations=500
                 )
             
+            solution = attach_solution_kpis(solution, data)
+            solution = make_json_safe(solution)
             current_solution = solution
             
             # Calculate savings if baseline exists
@@ -840,15 +911,14 @@ def run_optimization(baseline_clicks, optimized_clicks, stored_data, opt_method,
 )
 def run_simulation(simulation_clicks, stored_data, stored_solution):
     """Run discrete-time simulation"""
-    global current_simulation
+    global current_simulation, current_solution
     
     if not simulation_clicks or not stored_data or not stored_solution:
         return [None]
     
     try:
         # Reconstruct data and solution
-        data_dict = json.loads(stored_data)
-        data = {k: pd.DataFrame(v) for k, v in data_dict.items()}
+        data = get_data_frames(stored_data)
         
         solution = json.loads(stored_solution)
         assignments = solution.get('assignments', [])
@@ -856,10 +926,19 @@ def run_simulation(simulation_clicks, stored_data, stored_solution):
         # Run simulation
         simulator = LogisticsSimulator(data, time_step_hours=6)
         simulation_results = simulator.run_simulation(assignments, simulation_days=30)
+        simulation_results = make_json_safe(simulation_results)
         
         current_simulation = simulation_results
+
+        # Refresh current solution KPIs with simulation insights
+        global current_solution
+        if current_solution:
+            enriched_solution = attach_solution_kpis(current_solution, data, simulation_results)
+            current_solution = make_json_safe(enriched_solution)
+            # Also update stored_solution payload so UI consumers get the latest KPI mix
+            solution = current_solution
         
-        return [json.dumps(simulation_results, default=str)]
+        return [json.dumps(simulation_results)]
         
     except Exception as e:
         print(f"Simulation error: {e}")
@@ -868,31 +947,99 @@ def run_simulation(simulation_clicks, stored_data, stored_solution):
 
 @app.callback(
     Output("download-dispatch-csv-file", "data"),
-    [Input("download-dispatch-csv", "n_clicks")],
-    [State("stored-solution", "children")]
+    [Input("download-dispatch-csv", "n_clicks"),
+     Input("export-csv-btn", "n_clicks")],
+    [State("stored-solution", "children"),
+     State("stored-simulation", "children"),
+     State("stored-data", "children")]
 )
-def download_dispatch_csv(n_clicks, stored_solution):
-    if not n_clicks or not stored_solution:
+def download_dispatch_csv(_export_logs_clicks, _export_sidebar_clicks, stored_solution, stored_simulation, stored_data):
+    ctx = callback_context
+    if not ctx.triggered or not stored_solution:
         return None
+
+    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
+
     try:
         solution = json.loads(stored_solution)
         assignments = solution.get('assignments', [])
         if not assignments:
             return None
+
         df = pd.DataFrame(assignments)
+
+        # If triggered from the main sidebar button, provide a richer export bundle
+        if trigger_id == "export-csv-btn":
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_buffer:
+                zip_buffer.writestr("dispatch_plan.csv", df.to_csv(index=False))
+
+                # Include KPI summary if simulation has been run
+                simulation = json.loads(stored_simulation) if stored_simulation else {}
+                if not isinstance(simulation, dict):
+                    simulation = {}
+
+                data_frames = get_data_frames(stored_data)
+                kpis = solution.get('kpis', {}) or simulation.get('kpis', {})
+                if not kpis and data_frames:
+                    kpis = calculate_kpis(
+                        assignments,
+                        data_frames.get('vessels', pd.DataFrame()),
+                        data_frames.get('plants', pd.DataFrame()),
+                        simulation.get('kpis'),
+                        data_frames.get('ports', pd.DataFrame()),
+                        data_frames.get('rail_costs', pd.DataFrame())
+                    )
+                if kpis:
+                    kpi_df = pd.DataFrame([kpis])
+                    zip_buffer.writestr("kpi_summary.csv", kpi_df.to_csv(index=False))
+
+                # Include assignment aggregation by port/plant
+                if not df.empty:
+                    summary_df = (
+                        df.groupby(['port_id', 'plant_id'], dropna=False)
+                          .agg(assignments=('vessel_id', 'count'), cargo_mt=('cargo_mt', 'sum'))
+                          .reset_index()
+                    )
+                    zip_buffer.writestr("port_plant_summary.csv", summary_df.to_csv(index=False))
+
+                # Include a simple readme for context
+                summary_lines = [
+                    "SIH Logistics Optimization Export",
+                    "This archive contains the current dispatch plan and KPIs.",
+                    "Files:",
+                    "- dispatch_plan.csv: Vessel to plant assignments with timing.",
+                    "- kpi_summary.csv: Key performance indicators (if available).",
+                    "Generated by the sidebar Export CSV button.",
+                    f"Assignments exported: {len(df)}"
+                ]
+                zip_buffer.writestr("README.txt", "\n".join(summary_lines))
+
+            buffer.seek(0)
+            return dcc.send_bytes(buffer.getvalue(), "dispatch_export_bundle.zip")
+
+        # Default: simple CSV download from the Logs & Export tab
         return dcc.send_data_frame(df.to_csv, filename="dispatch_plan.csv", index=False)
-    except Exception:
+
+    except Exception as e:
+        print(f"Dispatch export error: {e}")
         return None
 
 
 @app.callback(
     Output("download-sap-file", "data"),
-    [Input("download-sap-format", "n_clicks")],
-    [State("stored-solution", "children"), State("stored-data", "children")]
+    [Input("download-sap-format", "n_clicks"),
+     Input("export-sap-btn", "n_clicks")],
+    [State("stored-solution", "children"),
+     State("stored-data", "children")]
 )
-def download_sap_format(n_clicks, stored_solution, stored_data):
-    if not n_clicks or not stored_solution or not stored_data:
+def download_sap_format(_export_logs_clicks, _export_sidebar_clicks, stored_solution, stored_data):
+    ctx = callback_context
+    if not ctx.triggered or not stored_solution or not stored_data:
         return None
+
+    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
+
     try:
         solution = json.loads(stored_solution)
         data_dict = json.loads(stored_data)
@@ -900,8 +1047,9 @@ def download_sap_format(n_clicks, stored_solution, stored_data):
         assignments = pd.DataFrame(solution.get('assignments', []))
         if assignments.empty:
             return None
+
         # Simple SAP-like flat export (placeholder fields)
-        sap = assignments.merge(vessels[['vessel_id','eta_day','port_id']].drop_duplicates(), on='vessel_id', how='left')
+        sap = assignments.merge(vessels[['vessel_id', 'eta_day', 'port_id']].drop_duplicates(), on='vessel_id', how='left')
         sap = sap.rename(columns={
             'vessel_id': 'Vessel',
             'port_id': 'Port',
@@ -910,13 +1058,47 @@ def download_sap_format(n_clicks, stored_solution, stored_data):
             'time_period': 'Planned_Day',
             'berth_time': 'Planned_Berth_Day'
         })
-        cols = ['Vessel','Port','Plant','Quantity_MT','Planned_Day','Planned_Berth_Day','eta_day']
+        cols = ['Vessel', 'Port', 'Plant', 'Quantity_MT', 'Planned_Day', 'Planned_Berth_Day', 'eta_day']
         for c in cols:
             if c not in sap.columns:
                 sap[c] = None
         sap = sap[cols]
+
+        if trigger_id == "export-sap-btn":
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_buffer:
+                zip_buffer.writestr("sap_dispatch_template.csv", sap.to_csv(index=False))
+
+                # Provide vessel meta sheet for planners
+                if not vessels.empty:
+                    meta_cols = ['_id', 'vessel_id', 'cargo_mt', 'eta_day', 'port_id', 'demurrage_rate']
+                    available_meta_cols = [col for col in meta_cols if col in vessels.columns]
+                    if available_meta_cols:
+                        vessel_meta = vessels[available_meta_cols].copy()
+                        if '_id' in vessel_meta.columns:
+                            vessel_meta = vessel_meta.rename(columns={'_id': 'RecordID'})
+                        zip_buffer.writestr("vessel_metadata.csv", vessel_meta.to_csv(index=False))
+
+                assignments = solution.get('assignments', [])
+                if assignments:
+                    plan_df = pd.DataFrame(assignments)
+                    zip_buffer.writestr("assignment_details.csv", plan_df.to_csv(index=False))
+
+                instructions = [
+                    "SAP Upload Package",
+                    "Use sap_dispatch_template.csv to upload into SAP.",
+                    "Reference vessel_metadata.csv for demurrage and ETA information.",
+                    "Generated via the sidebar Export SAP button."
+                ]
+                zip_buffer.writestr("README.txt", "\n".join(instructions))
+
+            buffer.seek(0)
+            return dcc.send_bytes(buffer.getvalue(), "sap_export_bundle.zip")
+
+        # Default export pathway
         return dcc.send_data_frame(sap.to_csv, filename="dispatch_sap_export.csv", index=False)
-    except Exception:
+    except Exception as e:
+        print(f"SAP export error: {e}")
         return None
 
 
@@ -1094,6 +1276,61 @@ def update_kpi_cards(stored_solution, stored_simulation, stored_data):
         print(f"KPI cards error: {e}")
         return []
 
+def build_gantt_dataframe(stored_solution: Optional[str], stored_data: Optional[str]) -> pd.DataFrame:
+    """Generate a normalized dataframe used by gantt chart and exports."""
+    if not stored_solution or not stored_data:
+        return pd.DataFrame()
+
+    try:
+        solution = json.loads(stored_solution)
+        data_dict = json.loads(stored_data)
+
+        assignments = solution.get('assignments', [])
+        if not assignments:
+            return pd.DataFrame()
+
+        vessels_df = pd.DataFrame(data_dict.get('vessels', []))
+        if vessels_df.empty:
+            return pd.DataFrame()
+
+        rows = []
+        for assign in assignments:
+            vessel_id = assign.get('vessel_id', 'Unknown')
+            vessel_row = vessels_df[vessels_df['vessel_id'] == vessel_id]
+            if vessel_row.empty:
+                continue
+
+            eta_day = vessel_row.iloc[0].get('eta_day', 0)
+            try:
+                eta_day = float(eta_day)
+            except (TypeError, ValueError):
+                continue
+
+            cargo_mt = assign.get('cargo_mt', 0)
+            try:
+                cargo_mt = float(cargo_mt)
+            except (TypeError, ValueError):
+                cargo_mt = 0.0
+
+            processing_days = max(1.0, cargo_mt / 10000.0) if cargo_mt else 1.0
+
+            rows.append({
+                'Vessel': vessel_id,
+                'Port': assign.get('port_id', 'Unknown'),
+                'Plant': assign.get('plant_id', 'Unknown'),
+                'CargoMT': cargo_mt,
+                'StartDay': eta_day,
+                'FinishDay': eta_day + processing_days,
+                'DurationDays': processing_days
+            })
+
+        return pd.DataFrame(rows)
+
+    except Exception as e:
+        print(f"Gantt data build error: {e}")
+        return pd.DataFrame()
+
+
 @app.callback(
     Output("gantt-chart", "figure"),
     [Input("stored-solution", "children"),
@@ -1111,44 +1348,15 @@ def update_gantt_chart(stored_solution, refresh_clicks, stored_data):
         )
     
     try:
-        solution = json.loads(stored_solution)
-        data_dict = json.loads(stored_data)
-        
-        assignments = solution.get('assignments', [])
-        vessels_df = pd.DataFrame(data_dict['vessels'])
-        
-        if not assignments:
+        gantt_df = build_gantt_dataframe(stored_solution, stored_data)
+
+        if gantt_df.empty:
             return go.Figure().add_annotation(
                 text="No vessel assignments found",
                 xref="paper", yref="paper",
                 x=0.5, y=0.5, showarrow=False
             )
-        
-        # Create Gantt chart data
-        gantt_data = []
-        
-        for assign in assignments:
-            vessel_id = assign.get('vessel_id', 'Unknown')
-            port_id = assign.get('port_id', 'Unknown')
-            plant_id = assign.get('plant_id', 'Unknown')
-            cargo_mt = assign.get('cargo_mt', 0)
-            
-            # Get vessel ETA
-            vessel_row = vessels_df[vessels_df['vessel_id'] == vessel_id]
-            if not vessel_row.empty:
-                eta_day = vessel_row.iloc[0]['eta_day']
-                # Estimate processing time based on cargo (rough: 1 day per 10k MT)
-                processing_days = max(1, cargo_mt / 10000)
-                
-                gantt_data.append({
-                    'Task': vessel_id,
-                    'Start': eta_day,
-                    'Finish': eta_day + processing_days,
-                    'Port': port_id,
-                    'Plant': plant_id,
-                    'Cargo': cargo_mt
-                })
-        
+
         # Create figure
         fig = go.Figure()
         
@@ -1161,23 +1369,24 @@ def update_gantt_chart(stored_solution, refresh_clicks, stored_data):
             'CHENNAI': '#17a2b8'
         }
         
-        for i, row in enumerate(gantt_data):
+        gantt_records = gantt_df.to_dict('records')
+        for i, row in enumerate(gantt_records):
             color = port_colors.get(row['Port'], '#6c757d')
             
             fig.add_trace(go.Bar(
-                x=[row['Finish'] - row['Start']],
-                y=[row['Task']],
-                base=row['Start'],
+                x=[row['FinishDay'] - row['StartDay']],
+                y=[row['Vessel']],
+                base=row['StartDay'],
                 orientation='h',
                 marker=dict(color=color),
                 name=row['Port'],
-                showlegend=(i == 0 or row['Port'] not in [gantt_data[j]['Port'] for j in range(i)]),
-                hovertemplate=f"<b>{row['Task']}</b><br>" +
+                showlegend=(i == 0 or row['Port'] not in [gantt_records[j]['Port'] for j in range(i)]),
+                hovertemplate=f"<b>{row['Vessel']}</b><br>" +
                              f"Port: {row['Port']}<br>" +
                              f"Plant: {row['Plant']}<br>" +
-                             f"Cargo: {row['Cargo']:,.0f} MT<br>" +
-                             f"Days {row['Start']:.1f} - {row['Finish']:.1f}<br>" +
-                             f"Duration: {row['Finish']-row['Start']:.1f} days<extra></extra>"
+                             f"Cargo: {row['CargoMT']:,.0f} MT<br>" +
+                             f"Days {row['StartDay']:.1f} - {row['FinishDay']:.1f}<br>" +
+                             f"Duration: {row['DurationDays']:.1f} days<extra></extra>"
             ))
         
         fig.update_layout(
@@ -1201,6 +1410,57 @@ def update_gantt_chart(stored_solution, refresh_clicks, stored_data):
             x=0.5, y=0.5, showarrow=False,
             font=dict(size=12, color="red")
         )
+
+
+@app.callback(
+    Output("download-gantt-csv", "data"),
+    [Input("export-gantt-btn", "n_clicks")],
+    [State("stored-solution", "children"),
+     State("stored-data", "children")]
+)
+def download_gantt_csv(n_clicks, stored_solution, stored_data):
+    if not n_clicks or not stored_solution or not stored_data:
+        return None
+
+    gantt_df = build_gantt_dataframe(stored_solution, stored_data)
+    if gantt_df.empty:
+        return None
+
+    try:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_buffer:
+            zip_buffer.writestr("gantt_schedule.csv", gantt_df.to_csv(index=False))
+
+            port_summary = gantt_df.groupby('Port').agg(
+                Vessels=('Vessel', 'count'),
+                TotalCargoMT=('CargoMT', 'sum'),
+                AvgDurationDays=('DurationDays', 'mean')
+            ).reset_index()
+            zip_buffer.writestr("port_summary.csv", port_summary.to_csv(index=False))
+
+            plant_summary = gantt_df.groupby('Plant').agg(
+                Vessels=('Vessel', 'count'),
+                TotalCargoMT=('CargoMT', 'sum'),
+                AvgDurationDays=('DurationDays', 'mean')
+            ).reset_index()
+            zip_buffer.writestr("plant_summary.csv", plant_summary.to_csv(index=False))
+
+            readme = [
+                "Gantt Schedule Export Package",
+                "Included files:",
+                "- gantt_schedule.csv: Detailed vessel timeline.",
+                "- port_summary.csv: Aggregated stats per port.",
+                "- plant_summary.csv: Aggregated stats per plant.",
+                "Generated via the Gantt tab export button."
+            ]
+            zip_buffer.writestr("README.txt", "\n".join(readme))
+
+        buffer.seek(0)
+        return dcc.send_bytes(buffer.getvalue(), "gantt_schedule_export.zip")
+    except Exception as e:
+        print(f"Gantt export error: {e}")
+        return None
+
 
 @app.callback(
     [Output("schedule-details", "children"),
@@ -1681,6 +1941,99 @@ def update_rake_heatmap(stored_solution, stored_data):
     except Exception as e:
         print(f"Rake heatmap error: {e}")
         return go.Figure()
+
+
+@app.callback(
+    [Output("rake-statistics", "children"),
+     Output("rake-assignment-table", "children")],
+    [Input("stored-solution", "children"),
+     Input("stored-simulation", "children")],
+    [State("stored-data", "children")]
+)
+def update_rake_panels(stored_solution, stored_simulation, stored_data):
+    """Render rake summary stats and detailed assignment table."""
+    if not stored_solution:
+        empty_msg = html.P("Run an optimization to view rake utilization", className="text-muted")
+        return empty_msg, empty_msg
+
+    try:
+        solution = json.loads(stored_solution)
+        assignments = solution.get('assignments', [])
+
+        if not assignments:
+            empty_msg = html.P("No rake movements planned.", className="text-muted")
+            return empty_msg, empty_msg
+
+        df = pd.DataFrame(assignments)
+
+        # Compute stats
+        total_rakes = int(df.get('rakes_required', pd.Series(dtype=int)).sum()) if 'rakes_required' in df else 0
+        total_cargo = float(df.get('cargo_mt', pd.Series(dtype=float)).sum()) if 'cargo_mt' in df else 0.0
+        unique_ports = df['port_id'].nunique() if 'port_id' in df else 0
+        unique_plants = df['plant_id'].nunique() if 'plant_id' in df else 0
+
+        simulation = json.loads(stored_simulation) if stored_simulation else {}
+        kpis = simulation.get('kpis', {}) if isinstance(simulation, dict) else {}
+        rake_utilization = kpis.get('avg_rake_utilization')
+
+        stats_items = []
+        stats_items.append(dbc.ListGroupItem([
+            html.Strong("Total Rakes Scheduled"),
+            html.Span(f"{total_rakes}", className="badge bg-primary float-end")
+        ]))
+        stats_items.append(dbc.ListGroupItem([
+            html.Strong("Cargo Moved"),
+            html.Span(f"{total_cargo:,.0f} MT", className="badge bg-success float-end")
+        ]))
+        stats_items.append(dbc.ListGroupItem([
+            html.Strong("Ports Involved"),
+            html.Span(str(unique_ports), className="badge bg-info float-end")
+        ]))
+        stats_items.append(dbc.ListGroupItem([
+            html.Strong("Plants Served"),
+            html.Span(str(unique_plants), className="badge bg-warning text-dark float-end")
+        ]))
+        if rake_utilization is not None:
+            stats_items.append(dbc.ListGroupItem([
+                html.Strong("Average Rake Utilization"),
+                html.Span(f"{rake_utilization:.2%}", className="badge bg-secondary float-end")
+            ]))
+
+        stats_component = dbc.ListGroup(stats_items, flush=True)
+
+        # Prepare detailed table
+        display_df = df.rename(columns={
+            'vessel_id': 'Vessel',
+            'port_id': 'Port',
+            'plant_id': 'Plant',
+            'cargo_mt': 'Cargo (MT)',
+            'rakes_required': 'Rakes Required',
+            'scheduled_day': 'Scheduled Day',
+            'berth_time': 'Berth Day',
+            'eta_day': 'ETA Day'
+        })
+
+        display_columns = [col for col in ['Vessel', 'Port', 'Plant', 'Cargo (MT)',
+                                           'Rakes Required', 'Scheduled Day', 'Berth Day', 'ETA Day']
+                           if col in display_df.columns]
+
+        table = dash_table.DataTable(
+            data=display_df[display_columns].to_dict('records'),
+            columns=[{'name': col, 'id': col} for col in display_columns],
+            page_size=10,
+            style_cell={'textAlign': 'left', 'padding': '8px', 'fontSize': 12},
+            style_header={'backgroundColor': '#0d6efd', 'color': 'white', 'fontWeight': 'bold'},
+            style_data_conditional=[
+                {'if': {'row_index': 'odd'}, 'backgroundColor': '#f8f9fa'}
+            ],
+            sort_action='native'
+        )
+
+        return stats_component, table
+
+    except Exception as exc:
+        error = html.P(f"Error building rake metrics: {exc}", className="text-danger")
+        return error, error
 
 @app.callback(
     Output("system-status", "children"),

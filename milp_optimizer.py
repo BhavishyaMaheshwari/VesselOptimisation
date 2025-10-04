@@ -125,6 +125,16 @@ class MILPOptimizer:
             for pl in plants:
                 for t in time_periods:
                     prob += x[v, vessel_port, pl, t] <= vessel_cargo * y[v, vessel_port, t]
+
+        # 5b. Block cargo flows from non-designated ports entirely
+        for v in vessels:
+            vessel_port = self.vessel_lookup[v]['port_id']
+            for p in ports:
+                if p == vessel_port:
+                    continue
+                for pl in plants:
+                    for t in time_periods:
+                        prob += x[v, p, pl, t] == 0
         
         # 6. Port capacity constraints
         for p in ports:
@@ -255,29 +265,36 @@ class MILPOptimizer:
                 for pl in self.plants_df['plant_id']:
                     for t in range(1, self.time_horizon + 1):
                         cargo_amount = pulp.value(cargo_flow[v, p, pl, t])
-                        if cargo_amount and cargo_amount > 0.1:  # Threshold for numerical precision
-                            
-                            # Check if vessel berths in this period
-                            berth_status = pulp.value(vessel_berth[v, p, t])
-                            
-                            scheduled_day = t
-                            predicted_delay = self.predicted_delay_days.get(v, 0.0)
-                            actual_berth_time = scheduled_day + predicted_delay
+                        if cargo_amount is None or cargo_amount <= 0.1:
+                            continue
 
-                            assignment = {
-                                'vessel_id': v,
-                                'port_id': p,
-                                'plant_id': pl,
-                                'time_period': scheduled_day,
-                                'scheduled_day': scheduled_day,
-                                'cargo_mt': round(cargo_amount, 2),
-                                'berth_time': actual_berth_time,
-                                'actual_berth_time': actual_berth_time,
-                                'planned_berth_time': float(self.vessel_lookup[v]['eta_day']),
-                                'predicted_delay_days': predicted_delay,
-                                'rakes_required': int(np.ceil(cargo_amount / self.rake_capacity_mt))
-                            }
-                            assignments.append(assignment)
+                        cargo_amount = float(cargo_amount)
+
+                        # Check if vessel actually berths in this period
+                        berth_status = pulp.value(vessel_berth[v, p, t])
+                        if berth_status is None or berth_status < 0.5:
+                            continue
+
+                        scheduled_day = int(t)
+                        predicted_delay = float(self.predicted_delay_days.get(v, 0.0))
+                        planned_eta = float(self.vessel_lookup[v]['eta_day'])
+                        actual_berth_time = float(scheduled_day + predicted_delay)
+
+                        assignment = {
+                            'vessel_id': v,
+                            'port_id': p,
+                            'plant_id': pl,
+                            'time_period': scheduled_day,
+                            'scheduled_day': scheduled_day,
+                            'cargo_mt': round(cargo_amount, 2),
+                            'berth_time': actual_berth_time,
+                            'actual_berth_time': actual_berth_time,
+                            'planned_berth_time': planned_eta,
+                            'predicted_delay_days': predicted_delay,
+                            'rakes_required': int(math.ceil(cargo_amount / self.rake_capacity_mt)),
+                            'eta_day': planned_eta
+                        }
+                        assignments.append(assignment)
         
         return assignments
     
