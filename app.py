@@ -46,17 +46,17 @@ def create_header():
             dbc.Row([
                 dbc.Col([
                     html.I(className="fas fa-ship me-2"),
-                    dbc.NavbarBrand("🚢🚂 SIH Logistics Optimization Simulator", className="ms-2")
+                    dbc.NavbarBrand("🚢 Port-Plant Logistics Optimization System", className="ms-2 fw-bold")
                 ], width="auto"),
                 dbc.Col([
-                    dbc.Badge("Production Ready", color="success", className="me-2"),
-                    dbc.Badge("Real-time Optimization", color="info")
+                    dbc.Badge("SIH 2025", color="success", className="me-2"),
+                    dbc.Badge("Steel Plant Logistics", color="primary")
                 ], width="auto", className="ms-auto")
             ], align="center", className="w-100")
         ], fluid=True),
-        color="dark",
+        color="primary",
         dark=True,
-        className="mb-4"
+        className="mb-3"
     )
 
 def create_controls_panel():
@@ -297,7 +297,25 @@ def create_gantt_tab():
             dbc.Col([
                 dbc.Card([
                     dbc.CardHeader([
-                        "🗓️ Vessel & Rake Schedule Timeline",
+                        html.Div([
+                            "🗓️ Vessel & Rake Schedule Timeline",
+                            html.Span([
+                                html.I(className="fas fa-info-circle chart-info-icon"),
+                                html.Div([
+                                    html.Strong("📊 How to Read This Chart"),
+                                    html.P("Each horizontal bar represents a vessel's complete stay at port:", 
+                                          style={'fontSize': '12px', 'marginTop': '6px'}),
+                                    html.Ul([
+                                        html.Li("Left edge: Vessel arrival (ETA)"),
+                                        html.Li("Bar length: Time from arrival to departure"),
+                                        html.Li("Color intensity: Cargo volume handled"),
+                                        html.Li("Gaps between bars: Demurrage periods (delays)")
+                                    ], style={'fontSize': '11px', 'paddingLeft': '18px'}),
+                                    html.P("💡 Tip: Overlapping bars indicate concurrent berth usage. Longer bars may indicate bottlenecks.",
+                                          style={'fontSize': '11px', 'marginTop': '8px', 'fontStyle': 'italic'})
+                                ], className="chart-info-tooltip")
+                            ], style={'position': 'relative', 'display': 'inline-block', 'marginLeft': '10px'})
+                        ], style={'display': 'inline-block'}),
                         dbc.ButtonGroup([
                             dbc.Button([html.I(className="fas fa-sync me-1"), "Refresh"], 
                                       id="refresh-gantt-btn", size="sm", color="outline-primary"),
@@ -338,7 +356,26 @@ def create_cost_tab():
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader("💰 Cost Breakdown Analysis"),
+                    dbc.CardHeader([
+                        html.Div([
+                            "💰 Cost Breakdown Analysis",
+                            html.Span([
+                                html.I(className="fas fa-info-circle chart-info-icon"),
+                                html.Div([
+                                    html.Strong("💵 Understanding Costs"),
+                                    html.P("This chart shows the three main cost components:",
+                                          style={'fontSize': '12px', 'marginTop': '6px'}),
+                                    html.Ul([
+                                        html.Li([html.Strong("Port Handling: "), "Cost to unload cargo at berth (₹/tonne)"]),
+                                        html.Li([html.Strong("Rail Transport: "), "Cost to ship cargo inland by rail (₹/tonne-km)"]),
+                                        html.Li([html.Strong("Demurrage: "), "Penalty for delays beyond scheduled time (₹/day per vessel)"])
+                                    ], style={'fontSize': '11px', 'paddingLeft': '18px'}),
+                                    html.P("⚠️ High demurrage indicates scheduling inefficiencies or berth congestion.",
+                                          style={'fontSize': '11px', 'marginTop': '8px', 'fontStyle': 'italic', 'color': '#dc3545'})
+                                ], className="chart-info-tooltip")
+                            ], style={'position': 'relative', 'display': 'inline-block', 'marginLeft': '10px'})
+                        ], style={'display': 'inline-block'})
+                    ]),
                     dbc.CardBody([
                         dcc.Graph(id="cost-breakdown-chart", style={"height": "450px"})
                     ])
@@ -372,7 +409,27 @@ def create_rake_tab():
         dbc.Row([
             dbc.Col([
                 dbc.Card([
-                    dbc.CardHeader("Rake Utilization Heatmap"),
+                    dbc.CardHeader([
+                        html.Div([
+                            "🚂 Rake Utilization Heatmap",
+                            html.Span([
+                                html.I(className="fas fa-info-circle chart-info-icon"),
+                                html.Div([
+                                    html.Strong("🚆 Rake Usage Patterns"),
+                                    html.P("This heatmap shows when and how often each rake is used:",
+                                          style={'fontSize': '12px', 'marginTop': '6px'}),
+                                    html.Ul([
+                                        html.Li([html.Strong("Rows: "), "Individual rake IDs"]),
+                                        html.Li([html.Strong("Columns: "), "Time periods (days or weeks)"]),
+                                        html.Li([html.Strong("Color intensity: "), "Number of trips in that period (darker = more trips)"]),
+                                        html.Li([html.Strong("White cells: "), "Rake idle during that time"])
+                                    ], style={'fontSize': '11px', 'paddingLeft': '18px'}),
+                                    html.P("🎯 Goal: Maximize color intensity uniformly to balance rake workload and increase utilization.",
+                                          style={'fontSize': '11px', 'marginTop': '8px', 'fontStyle': 'italic'})
+                                ], className="chart-info-tooltip")
+                            ], style={'position': 'relative', 'display': 'inline-block', 'marginLeft': '10px'})
+                        ], style={'display': 'inline-block'})
+                    ]),
                     dbc.CardBody([
                         dcc.Graph(id="rake-heatmap", style={"height": "400px"})
                     ])
@@ -943,16 +1000,31 @@ def update_kpi_cards(stored_solution, stored_simulation, stored_data):
         
         cards = []
         for card_data in cards_data:
-            # Determine delta color and icon
-            delta_color = "success"
-            delta_icon = "fas fa-arrow-down"
-            if card_data['delta'] and card_data['delta'] > 0:
+            # Determine delta color and icon - CORRECTED LOGIC
+            # Lower is better: Total Cost, Demurrage, Avg Wait
+            # Higher is better: Demand Fulfillment, Rake Utilization, Vessels Processed
+            
+            delta_color = "secondary"
+            delta_icon = "fas fa-minus"
+            
+            if card_data['delta'] is not None and card_data['delta'] != 0:
+                # Metrics where LOWER is BETTER (costs, delays)
                 if card_data['title'] in ['Total Cost', 'Demurrage Cost', 'Avg Vessel Wait']:
-                    delta_color = "danger"
-                    delta_icon = "fas fa-arrow-up"
-                else:
-                    delta_color = "success"
-                    delta_icon = "fas fa-arrow-up"
+                    if card_data['delta'] < 0:  # Decreased = Good
+                        delta_color = "success"
+                        delta_icon = "fas fa-arrow-down"
+                    else:  # Increased = Bad
+                        delta_color = "danger"
+                        delta_icon = "fas fa-arrow-up"
+                
+                # Metrics where HIGHER is BETTER (fulfillment, utilization, efficiency)
+                else:  # Demand Fulfillment, Rake Utilization, Vessels Processed
+                    if card_data['delta'] > 0:  # Increased = Good
+                        delta_color = "success"
+                        delta_icon = "fas fa-arrow-up"
+                    else:  # Decreased = Bad
+                        delta_color = "danger"
+                        delta_icon = "fas fa-arrow-down"
             
             # Create delta display
             delta_display = ""
@@ -962,17 +1034,56 @@ def update_kpi_cards(stored_solution, stored_simulation, stored_data):
                     html.Span(f"{card_data['delta_pct']:+.1f}%", className=f"text-{delta_color}")
                 ], className="mt-1")
             
+            # Build tooltip content (less flashy, more readable)
+            tooltip_content = html.Div([
+                html.Div(card_data.get('tooltip_title', card_data['title']), 
+                        className="kpi-tooltip-title"),
+                html.Div([
+                    html.Strong("Formula: "),
+                    html.Div(card_data.get('formula', 'N/A'), className="kpi-tooltip-formula")
+                ]),
+                html.Div([
+                    html.P(card_data.get('description', ''), 
+                          style={'marginTop': '8px', 'fontSize': '12px', 'lineHeight': '1.5'})
+                ]),
+                html.Div([
+                    html.Strong("Key Factors:", style={'display': 'block', 'marginTop': '10px', 'marginBottom': '6px'}),
+                    html.Div([
+                        html.Div([
+                            html.I(className="fas fa-check-circle", 
+                                  style={'width': '20px', 'color': '#28a745', 'marginRight': '8px'}),
+                            html.Span(factor, style={'fontSize': '12px'})
+                        ], className="kpi-tooltip-factor") 
+                        for factor in card_data.get('factors', [])
+                    ], className="kpi-tooltip-factors")
+                ])
+            ], className="kpi-tooltip")
+            
+            # Special styling for demurrage card (less flashy)
+            card_classes = f"kpi-card kpi-card-{card_data['color']} h-100"
+            if card_data.get('is_demurrage') and card_data['raw_value'] > 0:
+                card_classes += " demurrage-card"
+            
+            # Demurrage badge for non-zero values
+            demurrage_badge = None
+            if card_data.get('is_demurrage') and card_data['raw_value'] > 0:
+                demurrage_badge = html.Div("⚠️ PENALTY", className="demurrage-badge", 
+                                          style={'fontSize': '11px', 'padding': '4px 8px'})
+            
             card = dbc.Col([
                 dbc.Card([
                     dbc.CardBody([
+                        tooltip_content,
+                        demurrage_badge if demurrage_badge else None,
                         html.Div([
-                            html.I(className=f"{card_data['icon']} fa-2x text-{card_data['color']} mb-2"),
-                            html.H4(card_data['value'], className="mb-1"),
-                            html.P(card_data['title'], className="text-muted mb-1"),
+                            html.I(className=f"{card_data['icon']} fa-2x mb-2", 
+                                  style={'color': f'var(--bs-{card_data["color"]})'}),
+                            html.H3(card_data['value'], className="kpi-value mb-1"),
+                            html.P(card_data['title'], className="text-muted mb-1 fw-semibold"),
                             delta_display
-                        ], className="text-center")
-                    ])
-                ], className="h-100")
+                        ], className="text-center", style={'position': 'relative', 'zIndex': 1})
+                    ], style={'position': 'relative'})
+                ], className=card_classes, style={'minHeight': '200px'})
             ], width=2)
             
             cards.append(card)

@@ -15,53 +15,109 @@ class LogisticsVisualizer:
     
     @staticmethod
     def create_kpi_cards(kpis: Dict[str, float], baseline_kpis: Optional[Dict[str, float]] = None) -> List[Dict]:
-        """Create KPI cards with delta indicators"""
+        """Create KPI cards with delta indicators and informative tooltips"""
         
         cards = []
         
-        # Define KPI configurations
+        # Define KPI configurations with detailed explanations
         kpi_configs = [
             {
                 'title': 'Total Cost',
                 'key': 'total_cost',
                 'format': 'currency',
                 'color': 'danger',
-                'icon': 'fas fa-dollar-sign'
+                'icon': 'fas fa-dollar-sign',
+                'tooltip_title': '💰 Total Logistics Cost',
+                'formula': 'Port Handling + Rail Transport + Demurrage',
+                'description': 'Sum of all operational costs across the entire supply chain',
+                'factors': [
+                    'Port handling fees per MT',
+                    'Rail transport costs per MT-km',
+                    'Demurrage penalties for delays',
+                    'Vessel berth time optimization'
+                ]
             },
             {
                 'title': 'Demurrage Cost', 
                 'key': 'demurrage_cost',
                 'format': 'currency',
                 'color': 'warning',
-                'icon': 'fas fa-clock'
+                'icon': 'fas fa-clock',
+                'tooltip_title': '⏰ Vessel Delay Penalties',
+                'formula': 'Σ(Delay Days × Demurrage Rate per vessel)',
+                'description': 'Penalties charged when vessels wait beyond their scheduled berth time',
+                'factors': [
+                    'Actual berth time vs planned/ETA',
+                    'Per-vessel demurrage rate ($/day)',
+                    'Port congestion levels',
+                    'Berth availability optimization'
+                ],
+                'is_demurrage': True
             },
             {
                 'title': 'Demand Fulfillment',
                 'key': 'demand_fulfillment_pct',
                 'format': 'percentage',
                 'color': 'success',
-                'icon': 'fas fa-check-circle'
+                'icon': 'fas fa-chart-line',
+                'tooltip_title': '📦 Steel Plant Demand Coverage',
+                'formula': '(Total Cargo Delivered / Total Plant Demand) × 100%',
+                'description': 'Percentage of steel plant raw material requirements successfully met through optimized dispatch',
+                'factors': [
+                    'Plant-specific quality requirements (coking coal, limestone)',
+                    'Cargo successfully delivered via rail to plants',
+                    'Total planned demand across 5 steel plants',
+                    'Port-plant rail connectivity and capacity',
+                    'Higher % = Better supply chain efficiency'
+                ]
             },
             {
                 'title': 'Avg Vessel Wait',
                 'key': 'avg_vessel_wait_hours',
                 'format': 'hours',
                 'color': 'info',
-                'icon': 'fas fa-ship'
+                'icon': 'fas fa-ship',
+                'tooltip_title': '🚢 Average Waiting Time',
+                'formula': 'Σ(Planned Berth - ETA) / # vessels with wait',
+                'description': 'Average hours vessels wait before berthing (per vessel with delay)',
+                'factors': [
+                    'Port berth capacity constraints',
+                    'Vessel arrival schedule (ETA)',
+                    'Optimization vs FCFS scheduling',
+                    'Only counts vessels that waited'
+                ]
             },
             {
                 'title': 'Rake Utilization',
                 'key': 'avg_rake_utilization',
                 'format': 'decimal',
                 'color': 'primary',
-                'icon': 'fas fa-train'
+                'icon': 'fas fa-train',
+                'tooltip_title': '🚂 Rail Asset Efficiency',
+                'formula': 'Total Rake Trips / Theoretical Capacity',
+                'description': 'How efficiently rail assets are being used for cargo transport',
+                'factors': [
+                    'Rakes available per day per port',
+                    'Simulation horizon (days)',
+                    'Actual trips made vs capacity',
+                    'Rake capacity (5000 MT each)'
+                ]
             },
             {
                 'title': 'Vessels Processed',
                 'key': 'vessels_processed_pct',
                 'format': 'percentage',
                 'color': 'secondary',
-                'icon': 'fas fa-anchor'
+                'icon': 'fas fa-anchor',
+                'tooltip_title': '⚓ Fleet Processing Rate',
+                'formula': '(Vessels Handled / Total Vessels) × 100%',
+                'description': 'Percentage of fleet successfully processed through the system',
+                'factors': [
+                    'Vessels with completed unloading',
+                    'Total fleet size in schedule',
+                    'Port handling capacity',
+                    'Time horizon constraints'
+                ]
             }
         ]
         
@@ -97,7 +153,12 @@ class LogisticsVisualizer:
                 'delta': delta,
                 'delta_pct': delta_pct,
                 'color': config['color'],
-                'icon': config['icon']
+                'icon': config['icon'],
+                'tooltip_title': config.get('tooltip_title', ''),
+                'formula': config.get('formula', ''),
+                'description': config.get('description', ''),
+                'factors': config.get('factors', []),
+                'is_demurrage': config.get('is_demurrage', False)
             }
             
             cards.append(card)
@@ -311,15 +372,23 @@ class LogisticsVisualizer:
         
         # Fill utilization matrix from assignments
         for assignment in assignments:
-            port_id = assignment['port_id']
-            time_period = assignment.get('time_period', assignment.get('berth_time', 1))
+            port_id = assignment.get('port_id')
+            # Be robust: get time_period, or fallback to berth_time, default to day 1
+            tp_val = assignment.get('time_period')
+            if tp_val is None:
+                tp_val = assignment.get('berth_time')
+            if tp_val is None:
+                tp_val = 1
+            try:
+                day_val = int(float(tp_val))
+            except Exception:
+                day_val = 1
             rakes_required = assignment.get('rakes_required', 1)
-            
+
             if port_id in ports:
                 port_idx = ports.index(port_id)
-                day_idx = min(int(time_period) - 1, len(days) - 1)
-                if 0 <= day_idx < len(days):
-                    utilization_matrix[port_idx, day_idx] += rakes_required
+                day_idx = min(max(day_val - 1, 0), len(days) - 1)
+                utilization_matrix[port_idx, day_idx] += rakes_required
         
         # Calculate utilization percentage
         utilization_pct = np.divide(utilization_matrix, availability_matrix, 

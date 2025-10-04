@@ -9,6 +9,9 @@ from typing import Dict, List, Tuple, Optional
 from deap import base, creator, tools, algorithms
 import copy
 import time
+import math
+
+from utils import ETAPredictor
 
 class HeuristicOptimizer:
     """Heuristic optimization using GA and Simulated Annealing"""
@@ -27,6 +30,20 @@ class HeuristicOptimizer:
         
         # DEAP setup will be done when needed
         self.toolbox = None
+
+        # Pre-compute predicted delays for each vessel (in days)
+        self.eta_predictor = ETAPredictor()
+        self.predicted_delay_days: Dict[str, float] = {}
+        for vessel_id, vessel_data in self.vessel_lookup.items():
+            try:
+                delay_hours = self.eta_predictor.predict_delay(
+                    vessel_id=vessel_id,
+                    port_id=vessel_data['port_id'],
+                    base_eta=float(vessel_data['eta_day'])
+                )
+                self.predicted_delay_days[vessel_id] = max(0.0, delay_hours / 24.0)
+            except Exception:
+                self.predicted_delay_days[vessel_id] = 0.0
     
     def _setup_deap(self):
         """Setup DEAP framework for genetic algorithm"""
@@ -101,15 +118,29 @@ class HeuristicOptimizer:
         
         for vessel_id, plant_id, berth_day in individual:
             vessel_data = self.vessel_lookup[vessel_id]
-            
+
+            # Safe handling of berth_day (can be None in hybrid methods)
+            if berth_day is None:
+                safe_berth_day = float(vessel_data.get('eta_day', 0))
+            else:
+                safe_berth_day = float(berth_day)
+
+            scheduled_day = safe_berth_day
+            predicted_delay = self.predicted_delay_days.get(vessel_id, 0.0)
+            actual_berth_time = scheduled_day + predicted_delay
+            planned_eta = float(vessel_data.get('eta_day', scheduled_day))
+
             assignment = {
                 'vessel_id': vessel_id,
                 'port_id': vessel_data['port_id'],
                 'plant_id': plant_id,
-                'time_period': int(berth_day),
+                'time_period': int(math.ceil(scheduled_day)),
+                'scheduled_day': scheduled_day,
                 'cargo_mt': vessel_data['cargo_mt'],
-                'berth_time': berth_day,
-                'planned_berth_time': berth_day,
+                'berth_time': actual_berth_time,
+                'actual_berth_time': actual_berth_time,
+                'planned_berth_time': planned_eta,
+                'predicted_delay_days': predicted_delay,
                 'rakes_required': int(np.ceil(vessel_data['cargo_mt'] / self.rake_capacity_mt))
             }
             assignments.append(assignment)
@@ -125,7 +156,7 @@ class HeuristicOptimizer:
             plant_id = assignment['plant_id']
             cargo_mt = assignment['cargo_mt']
             vessel_id = assignment['vessel_id']
-            berth_time = assignment['berth_time']
+            berth_time = assignment.get('actual_berth_time', assignment.get('berth_time'))
             
             # Port handling cost
             port_cost = self.port_lookup[port_id]['handling_cost_per_mt'] * cargo_mt
@@ -134,8 +165,8 @@ class HeuristicOptimizer:
             rail_cost = self._get_rail_cost(port_id, plant_id) * cargo_mt
             
             # Demurrage cost
-            vessel_eta = self.vessel_lookup[vessel_id]['eta_day']
-            delay_days = max(0, berth_time - vessel_eta) if berth_time is not None else 0
+            vessel_eta = assignment.get('planned_berth_time', self.vessel_lookup[vessel_id]['eta_day'])
+            delay_days = max(0, float(berth_time) - float(vessel_eta)) if berth_time is not None else 0
             demurrage_rate = self.vessel_lookup[vessel_id]['demurrage_rate']
             demurrage_cost = delay_days * demurrage_rate
             
@@ -406,10 +437,19 @@ class HeuristicOptimizer:
                     assignment['plant_id'] = random.choice(new_plants)
         
         elif modification == 'time':
-            # Change berth time (±2 days)
-            current_time = assignment['berth_time']
-            new_time = max(eta_day, current_time + random.uniform(-2, 2))
-            assignment['berth_time'] = new_time
-            assignment['time_period'] = int(new_time)
+            # Change scheduled berth day (±2 days) respecting ETA
+            current_schedule = assignment.get('scheduled_day', assignment.get('time_period', eta_day))
+            if current_schedule is None:
+                current_schedule = eta_day
+            new_schedule = max(eta_day, float(current_schedule) + random.uniform(-2, 2))
+            predicted_delay = assignment.get('predicted_delay_days', self.predicted_delay_days.get(vessel_id, 0.0))
+            actual_berth = new_schedule + predicted_delay
+
+            assignment['scheduled_day'] = new_schedule
+            assignment['time_period'] = int(math.ceil(new_schedule))
+            assignment['berth_time'] = actual_berth
+            assignment['actual_berth_time'] = actual_berth
+            assignment['predicted_delay_days'] = predicted_delay
+            assignment['planned_berth_time'] = assignment.get('planned_berth_time', eta_day)
         
         return neighbor

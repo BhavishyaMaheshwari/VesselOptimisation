@@ -50,12 +50,28 @@ class LogisticsSimulator:
         }
         self.rake_trip_count = 0
         self.assignment_states = {}
+
+        predicted_delay_map: Dict[str, float] = {}
+        for assignment in assignments:
+            vessel_id = assignment.get('vessel_id')
+            if not vessel_id:
+                continue
+            delay_days = float(assignment.get('predicted_delay_days', 0.0) or 0.0)
+            current_delay = predicted_delay_map.get(vessel_id, 0.0)
+            if delay_days > current_delay:
+                predicted_delay_map[vessel_id] = delay_days
         
         # Initialize vessel states
         for _, vessel in self.vessels_df.iterrows():
+            vessel_id = vessel['vessel_id']
+            eta_day = float(vessel['eta_day'])
+            delay_days = predicted_delay_map.get(vessel_id, 0.0)
+            planned_eta_time_step = int(eta_day * 24 / self.time_step_hours)
+            eta_time_step = int((eta_day + delay_days) * 24 / self.time_step_hours)
             self.vessel_states[vessel['vessel_id']] = {
                 'status': 'en_route',  # en_route, berthed, unloading, departed
-                'eta_time_step': int(vessel['eta_day'] * 24 / self.time_step_hours),
+                'eta_time_step': eta_time_step,
+                'planned_eta_time_step': planned_eta_time_step,
                 'berth_time_step': None,
                 'departure_time_step': None,
                 'cargo_remaining': vessel['cargo_mt'],
@@ -64,7 +80,8 @@ class LogisticsSimulator:
                 'assignments': [],
                 'planned_berth_time_step': None,
                 'handled_cargo': 0.0,
-                'demurrage_cost': 0.0
+                'demurrage_cost': 0.0,
+                'predicted_delay_days': delay_days
             }
         
         # Initialize port states
@@ -114,6 +131,8 @@ class LogisticsSimulator:
 
             rail_cost_per_mt = self._get_rail_cost(port_id, plant_id)
 
+            predicted_delay_days = float(raw_assignment.get('predicted_delay_days', vessel_state.get('predicted_delay_days', 0.0)) or 0.0)
+
             assignment_state = {
                 'vessel_id': vessel_id,
                 'port_id': port_id,
@@ -121,10 +140,15 @@ class LogisticsSimulator:
                 'total_cargo': cargo_mt,
                 'remaining_cargo': cargo_mt,
                 'planned_berth_time_step': planned_berth_time_step,
-                'rail_cost_per_mt': rail_cost_per_mt
+                'rail_cost_per_mt': rail_cost_per_mt,
+                'predicted_delay_days': predicted_delay_days
             }
 
             vessel_state['assignments'].append(assignment_state)
+            vessel_state['predicted_delay_days'] = max(vessel_state.get('predicted_delay_days', 0.0), predicted_delay_days)
+            updated_delay_days = vessel_state['predicted_delay_days']
+            eta_day = float(self.vessel_lookup[vessel_id]['eta_day'])
+            vessel_state['eta_time_step'] = int((eta_day + updated_delay_days) * 24 / self.time_step_hours)
 
             # Track planned berth window for demurrage calculations
             if planned_berth_time_step is not None:
@@ -262,8 +286,11 @@ class LogisticsSimulator:
                 vessel_state = self.vessel_states[next_vessel_id]
                 
                 # Check if this is the planned berth time
-                planned_berth = vessel_state.get('berth_time_step')
-                if not planned_berth or time_step >= planned_berth:
+                planned_schedule_step = vessel_state.get('planned_berth_time_step')
+                if planned_schedule_step is None:
+                    planned_schedule_step = vessel_state.get('planned_eta_time_step', vessel_state['eta_time_step'])
+
+                if time_step >= planned_schedule_step:
                     
                     port_state['current_vessel'] = next_vessel_id
                     vessel_state['status'] = 'berthed'
@@ -271,7 +298,7 @@ class LogisticsSimulator:
 
                     planned_step = vessel_state.get('planned_berth_time_step')
                     if planned_step is None:
-                        planned_step = vessel_state['eta_time_step']
+                        planned_step = vessel_state.get('planned_eta_time_step', vessel_state['eta_time_step'])
 
                     delay_steps = max(0, time_step - planned_step)
                     delay_hours = delay_steps * self.time_step_hours
@@ -501,15 +528,23 @@ class LogisticsSimulator:
         kpis['vessels_processed_pct'] = (departed_vessels / total_vessels * 100) if total_vessels > 0 else 0
         
         # Average waiting time
-        total_wait_time = 0
+        total_wait_time_hours = 0.0
         vessels_with_wait = 0
         for vessel_state in self.vessel_states.values():
-            if vessel_state['berth_time_step'] is not None and vessel_state['eta_time_step'] is not None:
-                wait_time = max(0, vessel_state['berth_time_step'] - vessel_state['eta_time_step'])
-                total_wait_time += wait_time * self.time_step_hours
-                vessels_with_wait += 1
-        
-        kpis['avg_vessel_wait_hours'] = (total_wait_time / vessels_with_wait) if vessels_with_wait > 0 else 0
+            berth_step = vessel_state.get('berth_time_step')
+            planned_step = vessel_state.get('planned_eta_time_step')
+            if planned_step is None:
+                planned_step = vessel_state.get('planned_berth_time_step')
+            if planned_step is None:
+                planned_step = vessel_state.get('eta_time_step')
+
+            if berth_step is not None and planned_step is not None:
+                wait_steps = max(0, berth_step - planned_step)
+                if wait_steps > 0:
+                    total_wait_time_hours += wait_steps * self.time_step_hours
+                    vessels_with_wait += 1
+
+        kpis['avg_vessel_wait_hours'] = (total_wait_time_hours / vessels_with_wait) if vessels_with_wait > 0 else 0
         
         # Rake utilization
         total_rakes = len(self.rake_states)

@@ -6,8 +6,9 @@ import pulp
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from utils import CostCalculator
+from utils import CostCalculator, ETAPredictor
 import time
+import math
 
 class MILPOptimizer:
     """Mixed Integer Linear Programming optimizer for logistics dispatch"""
@@ -24,6 +25,20 @@ class MILPOptimizer:
         self.port_lookup = self.ports_df.set_index('port_id').to_dict('index')
         self.plant_lookup = self.plants_df.set_index('plant_id').to_dict('index')
         self.vessel_lookup = self.vessels_df.set_index('vessel_id').to_dict('index')
+
+        # Predict inherent pre-berthing delays for realism (in days)
+        self.eta_predictor = ETAPredictor()
+        self.predicted_delay_days: Dict[str, float] = {}
+        for vessel_id, vessel_data in self.vessel_lookup.items():
+            try:
+                delay_hours = self.eta_predictor.predict_delay(
+                    vessel_id=vessel_id,
+                    port_id=vessel_data['port_id'],
+                    base_eta=float(vessel_data['eta_day'])
+                )
+                self.predicted_delay_days[vessel_id] = max(0.0, delay_hours / 24.0)
+            except Exception:
+                self.predicted_delay_days[vessel_id] = 0.0
         
     def build_milp_model(self, solver_time_limit: int = 300) -> Tuple[pulp.LpProblem, Dict]:
         """Build the MILP model for rake dispatch optimization"""
@@ -92,7 +107,7 @@ class MILPOptimizer:
         
         # 3. Vessel can berth only after ETA
         for v in vessels:
-            vessel_eta = int(self.vessel_lookup[v]['eta_day'])
+            vessel_eta = float(self.vessel_lookup[v]['eta_day'])
             vessel_port = self.vessel_lookup[v]['port_id']
             for t in time_periods:
                 if t < vessel_eta:
@@ -134,15 +149,21 @@ class MILPOptimizer:
         
         # 10. Demurrage cost calculation (simplified)
         for v in vessels:
-            vessel_eta = self.vessel_lookup[v]['eta_day']
+            vessel_eta = float(self.vessel_lookup[v]['eta_day'])
             vessel_port = self.vessel_lookup[v]['port_id']
-            demurrage_rate = self.vessel_lookup[v]['demurrage_rate']
-            
-            # Demurrage = rate * max(0, berth_time - eta)
-            prob += demurrage_cost[v] >= pulp.lpSum([
-                demurrage_rate * max(0, t - vessel_eta) * y[v, vessel_port, t]
-                for t in time_periods
-            ])
+            demurrage_rate = float(self.vessel_lookup[v]['demurrage_rate'])
+            inherent_delay = self.predicted_delay_days.get(v, 0.0)
+
+            delay_terms = []
+            for t in time_periods:
+                effective_delay = max(0.0, (t + inherent_delay) - vessel_eta)
+                if effective_delay > 0:
+                    delay_terms.append(demurrage_rate * effective_delay * y[v, vessel_port, t])
+
+            if delay_terms:
+                prob += demurrage_cost[v] >= pulp.lpSum(delay_terms)
+            else:
+                prob += demurrage_cost[v] >= 0
         
         variables = {
             'cargo_flow': x,
@@ -239,14 +260,21 @@ class MILPOptimizer:
                             # Check if vessel berths in this period
                             berth_status = pulp.value(vessel_berth[v, p, t])
                             
+                            scheduled_day = t
+                            predicted_delay = self.predicted_delay_days.get(v, 0.0)
+                            actual_berth_time = scheduled_day + predicted_delay
+
                             assignment = {
                                 'vessel_id': v,
                                 'port_id': p,
                                 'plant_id': pl,
-                                'time_period': t,
+                                'time_period': scheduled_day,
+                                'scheduled_day': scheduled_day,
                                 'cargo_mt': round(cargo_amount, 2),
-                                'berth_time': t if berth_status and berth_status > 0.5 else None,
-                                'planned_berth_time': t if berth_status and berth_status > 0.5 else None,
+                                'berth_time': actual_berth_time,
+                                'actual_berth_time': actual_berth_time,
+                                'planned_berth_time': float(self.vessel_lookup[v]['eta_day']),
+                                'predicted_delay_days': predicted_delay,
                                 'rakes_required': int(np.ceil(cargo_amount / self.rake_capacity_mt))
                             }
                             assignments.append(assignment)
@@ -258,7 +286,7 @@ class MILPOptimizer:
         print("Creating FCFS baseline solution...")
         
         assignments = []
-        port_utilization = {}  # Track when each port is busy
+        port_utilization: Dict[str, float] = {}  # Track when each port is busy
         
         # Sort vessels by ETA
         vessels_sorted = self.vessels_df.sort_values('eta_day')
@@ -268,7 +296,8 @@ class MILPOptimizer:
             vessel_port = vessel['port_id']
             cargo_grade = vessel['cargo_grade']
             cargo_mt = vessel['cargo_mt']
-            eta = vessel['eta_day']
+            eta = float(vessel['eta_day'])
+            predicted_delay = self.predicted_delay_days.get(vessel['vessel_id'], 0.0)
             
             # Find plants that can accept this cargo type
             compatible_plants = self.plants_df[
@@ -283,22 +312,28 @@ class MILPOptimizer:
                 # This creates realistic delays and demurrage costs
                 if vessel_port not in port_utilization:
                     port_utilization[vessel_port] = eta
-                
-                # Vessel berths when port is free or at ETA, whichever is later
-                actual_berth_time = max(eta, port_utilization[vessel_port])
+
+                arrival_with_delay = eta + predicted_delay
+                available_time = port_utilization[vessel_port]
+                actual_berth_time = max(arrival_with_delay, available_time)
                 
                 # Assume port takes 1-2 days to handle cargo (baseline is slower)
                 port_handling_days = 1.5  # Baseline is less efficient
                 port_utilization[vessel_port] = actual_berth_time + port_handling_days
+
+                scheduled_day = int(math.ceil(actual_berth_time))
                 
                 assignment = {
                     'vessel_id': vessel['vessel_id'],
                     'port_id': vessel_port,
                     'plant_id': target_plant['plant_id'],
-                    'time_period': int(actual_berth_time),
+                    'time_period': scheduled_day,
+                    'scheduled_day': scheduled_day,
                     'cargo_mt': cargo_mt,
                     'berth_time': actual_berth_time,
-                    'planned_berth_time': actual_berth_time,
+                    'actual_berth_time': actual_berth_time,
+                    'planned_berth_time': eta,
+                    'predicted_delay_days': predicted_delay,
                     'rakes_required': int(np.ceil(cargo_mt / self.rake_capacity_mt))
                 }
                 assignments.append(assignment)
@@ -325,7 +360,9 @@ class MILPOptimizer:
             plant_id = assignment['plant_id']
             cargo_mt = assignment['cargo_mt']
             vessel_id = assignment['vessel_id']
-            berth_time = assignment.get('berth_time', assignment.get('time_period', 0))
+            berth_time = assignment.get('actual_berth_time')
+            if berth_time is None:
+                berth_time = assignment.get('berth_time', assignment.get('time_period', 0))
             
             # Port handling cost
             port_cost = self.port_lookup[port_id]['handling_cost_per_mt'] * cargo_mt
@@ -335,11 +372,11 @@ class MILPOptimizer:
             
             # Demurrage cost (critical for realistic baseline)
             vessel_info = self.vessel_lookup[vessel_id]
-            vessel_eta = vessel_info['eta_day']
+            vessel_eta = float(assignment.get('planned_berth_time', vessel_info['eta_day']))
             demurrage_rate = vessel_info['demurrage_rate']
             
-            # Calculate delay in days (berth time - ETA)
-            delay_days = max(0, berth_time - vessel_eta) if berth_time is not None else 0
+            # Calculate delay in days (berth time - planned ETA)
+            delay_days = max(0, float(berth_time) - vessel_eta) if berth_time is not None else 0
             demurrage_cost = delay_days * demurrage_rate
             
             total_cost += port_cost + rail_cost + demurrage_cost

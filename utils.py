@@ -79,8 +79,7 @@ class CostCalculator:
         """Calculate demurrage cost for vessel delays"""
         if pd.isna(actual_berth_time) or pd.isna(planned_berth_time):
             return 0.0
-        delay_hours = max(0, actual_berth_time - planned_berth_time)
-        delay_days = delay_hours / 24.0
+        delay_days = max(0.0, float(actual_berth_time) - float(planned_berth_time))
         return delay_days * vessel_data['demurrage_rate']
     
     @staticmethod
@@ -231,7 +230,8 @@ def calculate_kpis(assignments: List[Dict], vessels_df: pd.DataFrame,
 
         # Operational estimates directly from assignments
         total_delivered = sum(a.get('cargo_mt', 0.0) for a in assignments)
-        unique_vessels = {a['vessel_id'] for a in assignments if 'vessel_id' in a}
+        unique_vessels_all = {a['vessel_id'] for a in assignments if 'vessel_id' in a}
+        unique_vessels = {v for v in unique_vessels_all if v in vessel_lookup}
         total_vessels = len(vessels_df)
         horizon_days = max((a.get('time_period') or 1) for a in assignments) if assignments else 1
         horizon_days = max(1, horizon_days)
@@ -260,21 +260,19 @@ def calculate_kpis(assignments: List[Dict], vessels_df: pd.DataFrame,
             if vessel_id not in vessel_lookup:
                 continue
             eta_day = float(vessel_lookup[vessel_id].get('eta_day', 0))
-            # Find earliest planned berth across this vessel's assignments
-            planned_values = []
+            # Find earliest actual berth across this vessel's assignments
+            actual_values = []
             for a in assignments:
                 if a.get('vessel_id') != vessel_id:
                     continue
-                planned = a.get('planned_berth_time')
-                if planned is None:
-                    planned = a.get('berth_time')
-                if planned is None:
-                    planned = a.get('time_period')
-                if planned is not None:
-                    planned_values.append(float(planned))
-            if planned_values:
-                min_planned = min(planned_values)
-                per_vessel_wait_days[vessel_id] = max(0.0, min_planned - eta_day)
+                actual = a.get('actual_berth_time', a.get('berth_time'))
+                if actual is None:
+                    actual = a.get('scheduled_day', a.get('time_period'))
+                if actual is not None:
+                    actual_values.append(float(actual))
+            if actual_values:
+                earliest_actual = min(actual_values)
+                per_vessel_wait_days[vessel_id] = max(0.0, earliest_actual - eta_day)
             else:
                 per_vessel_wait_days[vessel_id] = 0.0
 
