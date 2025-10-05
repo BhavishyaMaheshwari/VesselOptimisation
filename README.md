@@ -8,11 +8,14 @@ A production-quality **Dash web application** for optimizing railway rake dispat
 # 1. Install dependencies
 pip install -r requirements_dash.txt
 
-# 2. Launch dashboard
-python app.py
-# OR: python launch_dashboard.py
+# 2. Activate virtual environment
+source venv/bin/activate
 
-# 3. Open browser
+# 3. Launch dashboard
+python app.py
+# OR: python run.py
+
+# 4. Open browser
 http://127.0.0.1:5006/
 
 # 4. Quick demo

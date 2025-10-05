@@ -13,8 +13,7 @@ def main():
     try:
         # Import and run the app
         import app
-        from config import get_dashboard_url
-        print(f"🚀 Starting dashboard at {get_dashboard_url()}")
+        print("🚀 Starting dashboard at http://127.0.0.1:5006/")
         print("🔧 Press Ctrl+C to stop")
         # Launch via the module's run_server helper (reloader disabled inside)
         app.run_server(debug=False)

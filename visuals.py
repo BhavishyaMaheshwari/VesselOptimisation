@@ -26,8 +26,7 @@ class LogisticsVisualizer:
                 'key': 'total_cost',
                 'format': 'currency',
                 'color': 'danger',
-                'icon': 'fas fa-dollar-sign',
-                'tooltip_title': '💰 Total Logistics Cost',
+                'tooltip_title': 'Total logistics cost',
                 'formula': 'Port Handling + Rail Transport + Demurrage',
                 'description': 'Sum of all operational costs across the entire supply chain',
                 'factors': [
@@ -42,8 +41,7 @@ class LogisticsVisualizer:
                 'key': 'demurrage_cost',
                 'format': 'currency',
                 'color': 'warning',
-                'icon': 'fas fa-clock',
-                'tooltip_title': '⏰ Vessel Delay Penalties',
+                'tooltip_title': 'Vessel delay penalties',
                 'formula': 'Σ(Delay Days × Demurrage Rate per vessel)',
                 'description': 'Penalties charged when vessels wait beyond their scheduled berth time',
                 'factors': [
@@ -59,8 +57,7 @@ class LogisticsVisualizer:
                 'key': 'demand_fulfillment_pct',
                 'format': 'percentage',
                 'color': 'success',
-                'icon': 'fas fa-chart-line',
-                'tooltip_title': '📦 Steel Plant Demand Coverage',
+                'tooltip_title': 'Steel plant demand coverage',
                 'formula': '(Total Cargo Delivered / Total Plant Demand) × 100%',
                 'description': 'Percentage of steel plant raw material requirements successfully met through optimized dispatch',
                 'factors': [
@@ -76,8 +73,7 @@ class LogisticsVisualizer:
                 'key': 'avg_vessel_wait_hours',
                 'format': 'hours',
                 'color': 'info',
-                'icon': 'fas fa-ship',
-                'tooltip_title': '🚢 Average Waiting Time',
+                'tooltip_title': 'Average waiting time',
                 'formula': 'Σ(Planned Berth - ETA) / # vessels with wait',
                 'description': 'Average hours vessels wait before berthing (per vessel with delay)',
                 'factors': [
@@ -92,8 +88,7 @@ class LogisticsVisualizer:
                 'key': 'avg_rake_utilization',
                 'format': 'decimal',
                 'color': 'primary',
-                'icon': 'fas fa-train',
-                'tooltip_title': '🚂 Rail Asset Efficiency',
+                'tooltip_title': 'Rail asset efficiency',
                 'formula': 'Total Rake Trips / Theoretical Capacity',
                 'description': 'How efficiently rail assets are being used for cargo transport',
                 'factors': [
@@ -108,8 +103,7 @@ class LogisticsVisualizer:
                 'key': 'vessels_processed_pct',
                 'format': 'percentage',
                 'color': 'secondary',
-                'icon': 'fas fa-anchor',
-                'tooltip_title': '⚓ Fleet Processing Rate',
+                'tooltip_title': 'Fleet processing rate',
                 'formula': '(Vessels Handled / Total Vessels) × 100%',
                 'description': 'Percentage of fleet successfully processed through the system',
                 'factors': [
@@ -153,7 +147,6 @@ class LogisticsVisualizer:
                 'delta': delta,
                 'delta_pct': delta_pct,
                 'color': config['color'],
-                'icon': config['icon'],
                 'tooltip_title': config.get('tooltip_title', ''),
                 'formula': config.get('formula', ''),
                 'description': config.get('description', ''),
