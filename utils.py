@@ -1,12 +1,17 @@
-"""
-Utility functions for cost calculations, ML stubs, and helper functions
-"""
+"""Utility helpers for cost calculations, ML stubs, and KPI analytics."""
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 import random
+
+from config import (
+    EXCHANGE_RATE_INR_PER_USD,
+    PORT_BENCHMARKS,
+    SECONDARY_PORT_PENALTY_PER_MT,
+    DEMURRAGE_PENALTY_PER_MT_PER_DAY,
+)
 
 class ETAPredictor:
     """ML stub for ETA/delay prediction - placeholder for real ML model"""
@@ -74,6 +79,63 @@ class CostCalculator:
     """Utility class for various cost calculations"""
     
     @staticmethod
+    def usd_to_inr(amount_usd: float) -> float:
+        return float(amount_usd or 0.0) * EXCHANGE_RATE_INR_PER_USD
+
+    @staticmethod
+    def _safe_get(record, key: str, default=None):
+        if record is None:
+            return default
+        if isinstance(record, dict):
+            return record.get(key, default)
+        if isinstance(record, pd.Series):
+            return record.get(key, default)
+        return getattr(record, key, default)
+
+    @staticmethod
+    def get_freight_inr_per_mt(vessel_row) -> float:
+        if vessel_row is None:
+            return 0.0
+        freight_inr = CostCalculator._safe_get(vessel_row, 'freight_inr_per_mt')
+        if pd.notna(freight_inr) and float(freight_inr or 0.0) > 0:
+            return float(freight_inr)
+        freight_usd = CostCalculator._safe_get(vessel_row, 'freight_usd_per_mt')
+        if pd.notna(freight_usd) and float(freight_usd or 0.0) > 0:
+            return CostCalculator.usd_to_inr(float(freight_usd))
+        return 0.0
+
+    @staticmethod
+    def calculate_ocean_freight_cost(cargo_mt: float, vessel_row=None, freight_inr_per_mt: float = None,
+                                     freight_usd_per_mt: float = None) -> float:
+        if freight_inr_per_mt is not None and freight_inr_per_mt > 0:
+            rate_inr = freight_inr_per_mt
+        elif freight_usd_per_mt is not None and freight_usd_per_mt > 0:
+            rate_inr = CostCalculator.usd_to_inr(freight_usd_per_mt)
+        else:
+            rate_inr = CostCalculator.get_freight_inr_per_mt(vessel_row)
+        return cargo_mt * float(rate_inr or 0.0)
+
+    @staticmethod
+    def calculate_storage_cost(cargo_mt: float, dwell_days: float, port_id: str) -> float:
+        port_spec = PORT_BENCHMARKS.get(port_id)
+        if port_spec is None:
+            return 0.0
+        billable_days = max(0.0, dwell_days - port_spec.free_storage_days)
+        return cargo_mt * billable_days * port_spec.storage_cost_per_mt_per_day
+
+    @staticmethod
+    def calculate_rerouting_penalty(cargo_mt: float, primary_port: str, assigned_port: str) -> float:
+        if primary_port == assigned_port:
+            return 0.0
+        return cargo_mt * SECONDARY_PORT_PENALTY_PER_MT
+
+    @staticmethod
+    def calculate_delay_penalty(cargo_mt: float, delay_days: float) -> float:
+        if delay_days <= 0:
+            return 0.0
+        return cargo_mt * delay_days * DEMURRAGE_PENALTY_PER_MT_PER_DAY
+
+    @staticmethod
     def calculate_demurrage_cost(vessel_data: pd.Series, actual_berth_time: float, 
                                planned_berth_time: float) -> float:
         """Calculate demurrage cost for vessel delays"""
@@ -99,46 +161,126 @@ class CostCalculator:
                                      rail_costs_df: pd.DataFrame) -> Dict[str, float]:
         """Calculate comprehensive logistics costs"""
         costs = {
+            'ocean_freight': 0.0,
             'port_handling': 0.0,
+            'storage': 0.0,
             'rail_transport': 0.0,
             'demurrage': 0.0,
+            'rerouting_penalty': 0.0,
+            'delay_penalty': 0.0,
             'total': 0.0
         }
         
+        if assignments is None:
+            return costs
+
+        def normalize(value):
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return None
+            return str(value).strip().upper()
+
+        port_lookup: Dict[str, Dict] = {}
+        if ports_df is not None and not ports_df.empty:
+            for _, row in ports_df.iterrows():
+                port_id = normalize(row.get('port_id'))
+                if port_id:
+                    port_lookup[port_id] = row.to_dict()
+
+        rail_lookup: Dict[Tuple[str, str], float] = {}
+        if rail_costs_df is not None and not rail_costs_df.empty:
+            for _, row in rail_costs_df.iterrows():
+                port_id = normalize(row.get('port_id'))
+                plant_id = normalize(row.get('plant_id'))
+                if port_id and plant_id:
+                    rail_lookup[(port_id, plant_id)] = float(row.get('cost_per_mt', 0.0) or 0.0)
+
+        vessel_lookup: Dict[str, Dict] = {}
+        if vessels_df is not None and not vessels_df.empty:
+            for _, row in vessels_df.iterrows():
+                vessel_id = normalize(row.get('vessel_id'))
+                if vessel_id:
+                    vessel_lookup[vessel_id] = row.to_dict()
+
+        average_rail_cost = float(rail_costs_df['cost_per_mt'].mean()) if rail_costs_df is not None and not rail_costs_df.empty else 0.0
+
         for assignment in assignments:
-            vessel_id = assignment['vessel_id']
-            port_id = assignment['port_id']
-            plant_id = assignment['plant_id']
-            cargo_mt = assignment['cargo_mt']
-            
-            # Port handling cost
-            port_rows = ports_df[ports_df['port_id'] == port_id]
-            if port_rows.empty:
+            vessel_id_raw = assignment.get('vessel_id')
+            port_id_raw = assignment.get('port_id')
+            plant_id_raw = assignment.get('plant_id')
+            cargo_mt = float(assignment.get('cargo_mt', 0.0) or 0.0)
+            if cargo_mt <= 0:
                 continue
-            port_data = port_rows.iloc[0]
+
+            vessel_id = normalize(vessel_id_raw)
+            port_id = normalize(port_id_raw)
+            plant_id = normalize(plant_id_raw)
+            if port_id is None or vessel_id is None:
+                continue
+
+            port_data = port_lookup.get(port_id, {}).copy()
+            benchmark = PORT_BENCHMARKS.get(port_id)
+            if benchmark and not port_data:
+                port_data = {
+                    'handling_cost_per_mt': benchmark.handling_cost_per_mt,
+                    'storage_cost_per_mt_per_day': benchmark.storage_cost_per_mt_per_day,
+                    'free_storage_days': benchmark.free_storage_days
+                }
+            if not port_data:
+                continue
+
+            # Ensure key rates exist using benchmark fallback when needed
+            if port_data.get('handling_cost_per_mt', 0.0) in (None, 0.0) and benchmark:
+                port_data['handling_cost_per_mt'] = benchmark.handling_cost_per_mt
+            if port_data.get('storage_cost_per_mt_per_day', 0.0) in (None, 0.0) and benchmark:
+                port_data['storage_cost_per_mt_per_day'] = benchmark.storage_cost_per_mt_per_day
+            if port_data.get('free_storage_days', 0.0) in (None, 0.0) and benchmark:
+                port_data['free_storage_days'] = benchmark.free_storage_days
+
             costs['port_handling'] += CostCalculator.calculate_port_handling_cost(cargo_mt, port_data)
-            
-            # Rail transport cost
-            rail_rows = rail_costs_df[
-                (rail_costs_df['port_id'] == port_id) & 
-                (rail_costs_df['plant_id'] == plant_id)
-            ]
-            if rail_rows.empty:
-                rail_cost_per_mt = rail_costs_df['cost_per_mt'].mean() if not rail_costs_df.empty else 0.0
-            else:
-                rail_cost_per_mt = rail_rows.iloc[0]['cost_per_mt']
-            costs['rail_transport'] += CostCalculator.calculate_rail_transport_cost(
-                cargo_mt, rail_cost_per_mt
-            )
-            
-            # Demurrage cost (if delay information available)
-            if 'actual_berth_time' in assignment and 'planned_berth_time' in assignment:
-                vessel_data = vessels_df[vessels_df['vessel_id'] == vessel_id].iloc[0]
-                costs['demurrage'] += CostCalculator.calculate_demurrage_cost(
-                    vessel_data, assignment['actual_berth_time'], assignment['planned_berth_time']
-                )
+
+            rail_cost_per_mt = rail_lookup.get((port_id, plant_id), average_rail_cost)
+            costs['rail_transport'] += CostCalculator.calculate_rail_transport_cost(cargo_mt, rail_cost_per_mt)
+
+            vessel_data = vessel_lookup.get(vessel_id)
+            if vessel_data:
+                costs['ocean_freight'] += CostCalculator.calculate_ocean_freight_cost(cargo_mt, vessel_data)
+
+                dwell_days = assignment.get('dwell_days')
+                if dwell_days is None:
+                    dwell_days = assignment.get('predicted_delay_days', 0.0)
+                dwell_days = max(0.0, float(dwell_days or 0.0))
+
+                billable_storage_days = assignment.get('billable_storage_days')
+                if billable_storage_days is None:
+                    free_days = float(port_data.get('free_storage_days', 0.0) or 0.0)
+                    billable_storage_days = max(0.0, dwell_days - free_days)
+                storage_rate = float(port_data.get('storage_cost_per_mt_per_day', 0.0) or 0.0)
+                costs['storage'] += cargo_mt * float(billable_storage_days or 0.0) * storage_rate
+
+                delay_days = float(assignment.get('delay_days', dwell_days) or 0.0)
+                costs['delay_penalty'] += CostCalculator.calculate_delay_penalty(cargo_mt, delay_days)
+
+                primary_port = CostCalculator._safe_get(vessel_data, 'port_id')
+                if primary_port:
+                    primary_port_norm = normalize(primary_port)
+                    costs['rerouting_penalty'] += CostCalculator.calculate_rerouting_penalty(
+                        cargo_mt, primary_port_norm, port_id
+                    )
+
+                if 'actual_berth_time' in assignment and 'planned_berth_time' in assignment:
+                    costs['demurrage'] += CostCalculator.calculate_demurrage_cost(
+                        pd.Series(vessel_data), assignment['actual_berth_time'], assignment['planned_berth_time']
+                    )
         
-        costs['total'] = costs['port_handling'] + costs['rail_transport'] + costs['demurrage']
+        costs['total'] = (
+            costs['ocean_freight'] +
+            costs['port_handling'] +
+            costs['storage'] +
+            costs['rail_transport'] +
+            costs['demurrage'] +
+            costs['rerouting_penalty'] +
+            costs['delay_penalty']
+        )
         return costs
 
 class ScenarioGenerator:
@@ -180,12 +322,22 @@ class ScenarioGenerator:
 
 def format_currency(amount: float) -> str:
     """Format currency with appropriate units"""
-    if amount >= 1e6:
-        return f"${amount/1e6:.1f}M"
-    elif amount >= 1e3:
-        return f"${amount/1e3:.1f}K"
-    else:
-        return f"${amount:.0f}"
+    if amount is None or (isinstance(amount, float) and np.isnan(amount)):
+        amount = 0.0
+    value = float(amount)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+
+    crore_threshold = 1e7
+    lakh_threshold = 1e5
+
+    if value >= crore_threshold:
+        return f"{sign}₹{value / crore_threshold:.1f} Cr"
+    if value >= lakh_threshold:
+        return f"{sign}₹{value / lakh_threshold:.1f} L"
+    if value >= 1e3:
+        return f"{sign}₹{value:,.0f}"
+    return f"{sign}₹{value:.0f}"
 
 def format_tonnage(tonnage: float) -> str:
     """Format tonnage with appropriate units"""

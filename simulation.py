@@ -7,6 +7,11 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import copy
 from utils import CostCalculator
+from config import (
+    DEFAULT_RAKE_CAPACITY_MT,
+    PORT_BENCHMARKS,
+    classify_rail_transit,
+)
 
 class LogisticsSimulator:
     """Discrete-time simulation of logistics operations"""
@@ -18,7 +23,7 @@ class LogisticsSimulator:
         self.rail_costs_df = data['rail_costs']
         
         self.time_step_hours = time_step_hours
-        self.rake_capacity_mt = 5000
+        self.rake_capacity_mt = DEFAULT_RAKE_CAPACITY_MT
         
         # Create lookup dictionaries
         self.port_lookup = self.ports_df.set_index('port_id').to_dict('index')
@@ -35,7 +40,10 @@ class LogisticsSimulator:
         self.cost_components = {
             'demurrage': 0.0,
             'port_handling': 0.0,
-            'rail_transport': 0.0
+            'rail_transport': 0.0,
+            'storage': 0.0,
+            'ocean_freight': 0.0,
+            'rerouting_penalty': 0.0
         }
         self.rake_trip_count = 0
         
@@ -86,12 +94,21 @@ class LogisticsSimulator:
         
         # Initialize port states
         for _, port in self.ports_df.iterrows():
-            self.port_states[port['port_id']] = {
+            port_id = port['port_id']
+            daily_capacity = float(port.get('daily_capacity_mt', 0.0) or 0.0)
+            rakes_available = int(port.get('rakes_available_per_day', 0) or 0)
+            self.port_states[port_id] = {
                 'vessels_queue': [],
                 'current_vessel': None,
-                'daily_throughput': 0,
-                'rakes_in_use': 0,
-                'total_handled': 0
+                'throughput_remaining': daily_capacity,
+                'daily_capacity': daily_capacity,
+                'rakes_available_per_day': rakes_available,
+                'rakes_remaining': rakes_available,
+                'total_handled': 0.0,
+                'total_dispatched': 0.0,
+                'inventory': [],
+                'congestion_log': [],
+                'last_day_index': 0
             }
         
         # Initialize plant states
@@ -100,7 +117,8 @@ class LogisticsSimulator:
                 'total_received': 0,
                 'daily_received': 0,
                 'demand_remaining': plant['daily_demand_mt'] * simulation_days,
-                'deliveries': []
+                'deliveries': [],
+                'inventory': []
             }
         
         # Process assignments
@@ -187,11 +205,18 @@ class LogisticsSimulator:
         print(f"Running simulation for {simulation_days} days with {self.time_step_hours}h time steps")
         
         self.initialize_simulation(assignments, simulation_days)
+        steps_per_day = int(24 / self.time_step_hours)
         
         # Main simulation loop
         for time_step in range(self.total_time_steps):
             self.current_time = time_step
             current_day = time_step * self.time_step_hours / 24
+
+            # Reset daily capacities at the start of each day
+            if time_step % steps_per_day == 0:
+                self._reset_daily_limits(int(current_day))
+                self._age_port_inventories()
+                self._reset_plant_daily_receipts()
             
             # Process vessel arrivals
             self._process_vessel_arrivals(time_step)
@@ -230,6 +255,83 @@ class LogisticsSimulator:
         
         print(f"Simulation completed - Total cost: ${kpis.get('total_cost', 0):,.2f}")
         return results
+
+    def _reset_daily_limits(self, day_index: int):
+        for port_id, port_state in self.port_states.items():
+            port_state['throughput_remaining'] = port_state['daily_capacity']
+            port_state['rakes_remaining'] = port_state['rakes_available_per_day']
+            port_state['last_day_index'] = day_index
+            port_capacity = port_state['daily_capacity'] or 1.0
+            total_cargo_waiting = sum(
+                self.vessel_states[v]['initial_cargo']
+                for v in port_state['vessels_queue']
+            )
+            if port_state['current_vessel']:
+                total_cargo_waiting += self.vessel_states[port_state['current_vessel']]['cargo_remaining']
+            congestion_pct = min(1.0, total_cargo_waiting / port_capacity)
+            port_state['congestion_log'].append({
+                'day': day_index,
+                'congestion_pct': round(congestion_pct * 100, 2)
+            })
+
+    def _age_port_inventories(self):
+        for port_state in self.port_states.values():
+            for batch in port_state['inventory']:
+                batch['age_days'] += 1
+
+    def _reset_plant_daily_receipts(self):
+        for plant_state in self.plant_states.values():
+            plant_state['daily_received'] = 0
+
+    def _push_port_inventory(self, port_id: str, vessel_id: str, cargo_mt: float):
+        if cargo_mt <= 0:
+            return
+        port_state = self.port_states.get(port_id)
+        if port_state is None:
+            return
+        vessel_data = self.vessel_lookup.get(vessel_id, {})
+        cargo_grade = vessel_data.get('cargo_grade', 'UNKNOWN')
+        port_state['inventory'].append({
+            'vessel_id': vessel_id,
+            'cargo_mt': cargo_mt,
+            'remaining_mt': cargo_mt,
+            'grade': cargo_grade,
+            'age_days': 0
+        })
+
+    def _get_port_inventory_remaining(self, port_id: str, grade: Optional[str] = None) -> float:
+        port_state = self.port_states.get(port_id)
+        if not port_state:
+            return 0.0
+        total = 0.0
+        for batch in port_state['inventory']:
+            if grade and batch['grade'] != grade:
+                continue
+            total += batch['remaining_mt']
+        return total
+
+    def _consume_port_inventory(self, port_id: str, required_mt: float, grade: Optional[str] = None) -> float:
+        if required_mt <= 0:
+            return 0.0
+        port_state = self.port_states.get(port_id)
+        if not port_state:
+            return 0.0
+        remaining = required_mt
+        consumed = 0.0
+        for batch in port_state['inventory']:
+            if grade and batch['grade'] != grade:
+                continue
+            if batch['remaining_mt'] <= 0:
+                continue
+            take = min(batch['remaining_mt'], remaining)
+            batch['remaining_mt'] -= take
+            remaining -= take
+            consumed += take
+            if remaining <= 0:
+                break
+        # Remove emptied batches
+        port_state['inventory'] = [b for b in port_state['inventory'] if b['remaining_mt'] > 0.01]
+        return consumed
     
     def _process_vessel_arrivals(self, time_step: int):
         """Process vessel arrivals at ports"""
@@ -251,31 +353,45 @@ class LogisticsSimulator:
     
     def _process_berth_operations(self, time_step: int):
         """Process vessel berthing and unloading operations"""
+        steps_per_day = int(24 / self.time_step_hours)
+        per_step_factors = {
+            port_id: (port_state['daily_capacity'] / steps_per_day if steps_per_day else port_state['daily_capacity'])
+            for port_id, port_state in self.port_states.items()
+        }
+
         for port_id, port_state in self.port_states.items():
             
             # Check if current vessel finished unloading
             if port_state['current_vessel']:
                 vessel_id = port_state['current_vessel']
                 vessel_state = self.vessel_states[vessel_id]
-                
-                # Simple unloading: assume 8 hours per 10,000 MT
-                unloading_duration = max(1, int(vessel_state['cargo_remaining'] / 10000 * 8 / self.time_step_hours))
-                
-                if (vessel_state['berth_time_step'] and 
-                    time_step >= vessel_state['berth_time_step'] + unloading_duration):
-                    
-                    # Vessel finished unloading
+                step_capacity = per_step_factors.get(port_id, vessel_state['cargo_remaining'])
+                discharge_mt = min(
+                    vessel_state['cargo_remaining'],
+                    step_capacity,
+                    port_state['throughput_remaining']
+                )
+                if discharge_mt > 0:
+                    vessel_state['cargo_remaining'] -= discharge_mt
+                    port_state['throughput_remaining'] = max(0.0, port_state['throughput_remaining'] - discharge_mt)
+                    port_state['total_handled'] += discharge_mt
+                    self._push_port_inventory(port_id, vessel_id, discharge_mt)
+                    port_state.setdefault('discharged_today', 0.0)
+                    port_state['discharged_today'] += discharge_mt
+                    port_data = self.port_lookup.get(port_id, {})
+                    handling_rate = float(port_data.get('handling_cost_per_mt', 0.0) or 0.0)
+                    self.cost_components['port_handling'] += discharge_mt * handling_rate
+
+                if vessel_state['cargo_remaining'] <= 0:
                     vessel_state['status'] = 'departed'
                     vessel_state['departure_time_step'] = time_step
                     port_state['current_vessel'] = None
-                    handled_cargo = vessel_state.get('handled_cargo', 0.0)
-                    
                     self.simulation_log.append({
                         'time_step': time_step,
                         'event': 'vessel_departure',
                         'vessel_id': vessel_id,
                         'port_id': port_id,
-                        'cargo_handled': vessel_state['cargo_remaining']
+                        'cargo_handled': vessel_state['initial_cargo']
                     })
             
             # Berth next vessel if available
@@ -309,6 +425,7 @@ class LogisticsSimulator:
                     vessel_state['planned_berth_time_hours'] = planned_step * self.time_step_hours
                     vessel_state['actual_berth_time_hours'] = time_step * self.time_step_hours
                     self.cost_components['demurrage'] += demurrage_cost
+                    vessel_state['cargo_discharge_rate'] = per_step_factors.get(port_id, vessel_state['cargo_remaining'])
                     
                     self.simulation_log.append({
                         'time_step': time_step,
@@ -325,14 +442,26 @@ class LogisticsSimulator:
         
         # Process rake assignments from berthed vessels
         for vessel_id, vessel_state in self.vessel_states.items():
-            if (vessel_state['status'] == 'berthed' and 
-                vessel_state['assignments'] and
-                vessel_state['cargo_remaining'] > 0):
-                
-                # Try to assign rakes for this vessel's cargo
-                for assignment in vessel_state['assignments']:
-                    if assignment['vessel_id'] == vessel_id and assignment['remaining_cargo'] > 0:
-                        self._assign_rakes_to_vessel(vessel_id, assignment, time_step)
+            if not vessel_state['assignments']:
+                continue
+
+            port_id = vessel_state['port_id']
+            port_state = self.port_states.get(port_id)
+            if not port_state or port_state.get('rakes_remaining', 0) <= 0:
+                continue
+
+            cargo_grade = self.vessel_lookup.get(vessel_id, {}).get('cargo_grade')
+            if self._get_port_inventory_remaining(port_id, cargo_grade) <= 0:
+                continue
+
+            for assignment in vessel_state['assignments']:
+                if assignment['vessel_id'] != vessel_id or assignment['remaining_cargo'] <= 0:
+                    continue
+
+                self._assign_rakes_to_vessel(vessel_id, assignment, time_step)
+
+                if port_state.get('rakes_remaining', 0) <= 0:
+                    break
         
         # Update rake states
         for rake_id, rake_state in self.rake_states.items():
@@ -391,46 +520,68 @@ class LogisticsSimulator:
         vessel_state = self.vessel_states[vessel_id]
         port_id = vessel_state['port_id']
         plant_id = assignment['plant_id']
-        port_state = self.port_states.get(port_id, {})
+        port_state = self.port_states.get(port_id)
+
+        if not port_state:
+            return
 
         available_rakes = [
             rake_id for rake_id, rake_state in self.rake_states.items()
-            if (rake_state['status'] == 'available' and 
-                rake_state['current_location'] == port_id)
+            if (
+                rake_state['status'] == 'available' and
+                rake_state['current_location'] == port_id
+            )
         ]
 
-        while (available_rakes and vessel_state['cargo_remaining'] > 0 and 
-               assignment['remaining_cargo'] > 0):
-            rake_id = available_rakes.pop(0)
-            rake_state = self.rake_states[rake_id]
+        if not available_rakes:
+            return
 
-            cargo_to_load = min(
+        cargo_grade = self.vessel_lookup.get(vessel_id, {}).get('cargo_grade')
+
+        while (
+            available_rakes and
+            assignment['remaining_cargo'] > 0 and
+            port_state.get('rakes_remaining', 0) > 0
+        ):
+            inventory_available = self._get_port_inventory_remaining(port_id, cargo_grade)
+            if inventory_available <= 0:
+                break
+
+            desired_load = min(
                 self.rake_capacity_mt,
-                vessel_state['cargo_remaining'],
-                assignment['remaining_cargo']
+                assignment['remaining_cargo'],
+                inventory_available
+            )
+
+            cargo_to_load = self._consume_port_inventory(
+                port_id,
+                desired_load,
+                grade=cargo_grade
             )
 
             if cargo_to_load <= 0:
                 break
 
+            rake_id = available_rakes.pop(0)
+            rake_state = self.rake_states[rake_id]
+
+            port_state['rakes_remaining'] = max(0, port_state.get('rakes_remaining', 0) - 1)
+            port_state.setdefault('total_dispatched', 0.0)
+            port_state['total_dispatched'] += cargo_to_load
+
             rake_state['status'] = 'loading'
             rake_state['cargo_mt'] = cargo_to_load
             rake_state['destination_plant'] = plant_id
             rake_state['assignment_id'] = f"{vessel_id}_{plant_id}"
+            rake_state['current_location'] = port_id
 
             transit_time = self._get_transit_time(port_id, plant_id)
             rake_state['arrival_time_step'] = time_step + 1 + transit_time
             rake_state['status'] = 'in_transit'
+            rake_state['current_location'] = 'en_route'
 
-            vessel_state['cargo_remaining'] -= cargo_to_load
             vessel_state['handled_cargo'] += cargo_to_load
-            assignment['remaining_cargo'] -= cargo_to_load
-
-            if port_state:
-                port_state['total_handled'] += cargo_to_load
-
-            handling_cost = cargo_to_load * self.port_lookup[port_id]['handling_cost_per_mt']
-            self.cost_components['port_handling'] += handling_cost
+            assignment['remaining_cargo'] = max(0.0, assignment['remaining_cargo'] - cargo_to_load)
 
             rail_cost = cargo_to_load * assignment['rail_cost_per_mt']
             self.cost_components['rail_transport'] += rail_cost
@@ -441,7 +592,9 @@ class LogisticsSimulator:
                 'rake_id': rake_id,
                 'vessel_id': vessel_id,
                 'plant_id': plant_id,
-                'cargo_mt': cargo_to_load
+                'cargo_mt': cargo_to_load,
+                'grade': cargo_grade,
+                'source_port': port_id
             })
     
     def _get_transit_time(self, port_id: str, plant_id: str) -> int:

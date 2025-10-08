@@ -873,11 +873,13 @@ def load_data(load_sample_clicks, upload_contents, upload_filenames):
                     elif 'rail' in filename.lower():
                         uploaded_data['rail_costs'] = df
             
+            cleaned_data = DataLoader.standardize_dataset(uploaded_data)
+
             # Validate uploaded data
-            is_valid, errors = DataLoader.validate_csv_data(uploaded_data)
+            is_valid, errors = DataLoader.validate_csv_data(cleaned_data)
             
             if is_valid:
-                current_data = uploaded_data
+                current_data = cleaned_data
                 status = dbc.Alert(
                     f"Uploaded {len(uploaded_data)} datasets successfully.",
                     color="success"

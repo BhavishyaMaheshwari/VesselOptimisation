@@ -12,7 +12,8 @@ import time
 import math
 import re
 
-from utils import ETAPredictor
+from utils import ETAPredictor, CostCalculator
+from config import DEFAULT_RAKE_CAPACITY_MT, SECONDARY_PORT_PENALTY_PER_MT, PORT_BENCHMARKS
 from seed_utils import get_current_seed
 
 class HeuristicOptimizer:
@@ -23,7 +24,7 @@ class HeuristicOptimizer:
         self.ports_df = data['ports']
         self.plants_df = data['plants'] 
         self.rail_costs_df = data['rail_costs']
-        self.rake_capacity_mt = 5000
+        self.rake_capacity_mt = DEFAULT_RAKE_CAPACITY_MT
         
         # Create lookup dictionaries
         self.port_lookup = self.ports_df.set_index('port_id').to_dict('index')
@@ -33,7 +34,7 @@ class HeuristicOptimizer:
         # DEAP setup will be done when needed
         self.toolbox = None
 
-        self.secondary_port_penalty_per_mt = 50.0
+        self.secondary_port_penalty_per_mt = SECONDARY_PORT_PENALTY_PER_MT
         self.vessel_allowed_ports: Dict[str, List[str]] = {}
         self.primary_port_map: Dict[str, str] = {}
 
@@ -60,6 +61,240 @@ class HeuristicOptimizer:
                 except Exception:
                     delay_map[port_id] = 0.0
             self.predicted_delay_days[vessel_id] = delay_map
+
+    def _calculate_cost_components(self, assignments: List[Dict]) -> Dict[str, float]:
+        costs = {
+            'ocean_freight': 0.0,
+            'port_handling': 0.0,
+            'storage': 0.0,
+            'rail_transport': 0.0,
+            'demurrage': 0.0,
+            'rerouting_penalty': 0.0,
+            'delay_penalty': 0.0,
+            'total': 0.0
+        }
+
+        if not assignments:
+            return costs
+
+        for assignment in assignments:
+            vessel_id = assignment.get('vessel_id')
+            port_id = assignment.get('port_id')
+            plant_id = assignment.get('plant_id')
+
+            if vessel_id is None or port_id is None or plant_id is None:
+                continue
+
+            vessel_data = self.vessel_lookup.get(vessel_id)
+            port_data = self.port_lookup.get(port_id, {}).copy()
+            benchmark = PORT_BENCHMARKS.get(port_id)
+
+            if not vessel_data:
+                continue
+
+            cargo_mt = float(assignment.get('cargo_mt', vessel_data.get('cargo_mt', 0.0)) or 0.0)
+            if cargo_mt <= 0:
+                continue
+
+            handling_rate = float(port_data.get('handling_cost_per_mt', 0.0) or 0.0)
+            storage_rate = float(port_data.get('storage_cost_per_mt_per_day', 0.0) or 0.0)
+            free_days = float(port_data.get('free_storage_days', 0.0) or 0.0)
+
+            if benchmark:
+                if handling_rate <= 0:
+                    handling_rate = benchmark.handling_cost_per_mt
+                if storage_rate <= 0:
+                    storage_rate = benchmark.storage_cost_per_mt_per_day
+                if free_days <= 0:
+                    free_days = benchmark.free_storage_days
+
+            costs['port_handling'] += handling_rate * cargo_mt
+
+            rail_cost_per_mt = self._get_rail_cost(port_id, plant_id)
+            costs['rail_transport'] += rail_cost_per_mt * cargo_mt
+
+            dwell_days = assignment.get('dwell_days')
+            if dwell_days is None:
+                dwell_days = assignment.get('predicted_delay_days', 0.0)
+            dwell_days = max(0.0, float(dwell_days or 0.0))
+
+            billable_storage_days = assignment.get('billable_storage_days')
+            if billable_storage_days is None:
+                billable_storage_days = max(0.0, dwell_days - free_days)
+            billable_storage_days = max(0.0, float(billable_storage_days or 0.0))
+
+            costs['storage'] += cargo_mt * storage_rate * billable_storage_days
+
+            planned_eta = assignment.get('planned_berth_time')
+            if planned_eta is None:
+                planned_eta = vessel_data.get('eta_day')
+
+            actual_berth = assignment.get('actual_berth_time')
+            if actual_berth is None:
+                actual_berth = assignment.get('berth_time', assignment.get('time_period'))
+
+            if planned_eta is not None and actual_berth is not None:
+                delay_days = max(0.0, float(actual_berth) - float(planned_eta))
+            else:
+                delay_days = max(0.0, float(assignment.get('delay_days', dwell_days) or 0.0))
+
+            demurrage_rate = float(vessel_data.get('demurrage_rate', 0.0) or 0.0)
+            costs['demurrage'] += delay_days * demurrage_rate
+
+            primary_port = str(vessel_data.get('port_id')).strip().upper() if vessel_data.get('port_id') else None
+            if primary_port and primary_port != str(port_id).strip().upper():
+                costs['rerouting_penalty'] += cargo_mt * self.secondary_port_penalty_per_mt
+
+            costs['ocean_freight'] += CostCalculator.calculate_ocean_freight_cost(cargo_mt, vessel_data)
+
+        costs['total'] = (
+            costs['ocean_freight'] +
+            costs['port_handling'] +
+            costs['storage'] +
+            costs['rail_transport'] +
+            costs['demurrage'] +
+            costs['rerouting_penalty'] +
+            costs['delay_penalty']
+        )
+        return costs
+
+    def _get_compatible_plants(self, cargo_grade: str) -> List[str]:
+        matches = self.plants_df[
+            self.plants_df['quality_requirements'] == cargo_grade
+        ]
+        return matches['plant_id'].tolist()
+
+    def _build_assignment_record(self, vessel_id: str, vessel_data: Dict, port_id: str, plant_id: str) -> Dict:
+        cargo_mt = float(vessel_data.get('cargo_mt', 0.0) or 0.0)
+        eta_day = float(vessel_data.get('eta_day', 0.0) or 0.0)
+        port_data = self.port_lookup.get(port_id, {})
+        free_days = float(port_data.get('free_storage_days', 0.0) or 0.0)
+        predicted_delay = self.predicted_delay_days.get(vessel_id, {}).get(port_id, 0.0)
+        dwell_days = max(0.0, predicted_delay)
+        billable_storage_days = max(0.0, dwell_days - free_days)
+        berth_time = eta_day + predicted_delay
+
+        return {
+            'vessel_id': vessel_id,
+            'port_id': port_id,
+            'plant_id': plant_id,
+            'cargo_mt': cargo_mt,
+            'time_period': int(max(1, math.ceil(berth_time))),
+            'scheduled_day': eta_day,
+            'berth_time': berth_time,
+            'actual_berth_time': berth_time,
+            'planned_berth_time': eta_day,
+            'predicted_delay_days': predicted_delay,
+            'rakes_required': int(np.ceil(cargo_mt / self.rake_capacity_mt)) if self.rake_capacity_mt else 0,
+            'billable_storage_days': billable_storage_days,
+            'dwell_days': dwell_days,
+            'delay_days': dwell_days,
+            'primary_port_id': self.primary_port_map.get(vessel_id)
+        }
+
+    def _construct_cost_greedy_solution(self) -> Optional[Dict]:
+        assignments: List[Dict] = []
+
+        for vessel_id, vessel_data in self.vessel_lookup.items():
+            cargo_grade = vessel_data.get('cargo_grade')
+            allowed_ports = self.vessel_allowed_ports.get(vessel_id, [self.primary_port_map.get(vessel_id)])
+            compatible_plants = self._get_compatible_plants(cargo_grade) if cargo_grade else []
+
+            if not allowed_ports or not compatible_plants:
+                continue
+
+            best_candidate = None
+
+            for port_id in allowed_ports:
+                for plant_id in compatible_plants:
+                    assignment = self._build_assignment_record(vessel_id, vessel_data, port_id, plant_id)
+                    candidate_cost = self._calculate_cost_components([assignment])['total']
+
+                    if best_candidate is None or candidate_cost < best_candidate['cost']:
+                        best_candidate = {
+                            'assignment': assignment,
+                            'cost': candidate_cost
+                        }
+
+            if best_candidate:
+                assignments.append(best_candidate['assignment'])
+
+        if not assignments:
+            return None
+
+        cost_components = self._calculate_cost_components(assignments)
+        return {
+            'status': 'Greedy_Optimized',
+            'method': 'Cost-Greedy Heuristic',
+            'objective_value': cost_components['total'],
+            'assignments': assignments,
+            'cost_components': cost_components,
+            'solve_time': 0.05
+        }
+
+    def _refine_with_local_search(self, solution: Dict) -> Dict:
+        assignments = solution.get('assignments', [])
+        if not assignments:
+            return solution
+
+        best_assignments = copy.deepcopy(assignments)
+        best_components = self._calculate_cost_components(best_assignments)
+        best_cost = best_components['total']
+
+        improvement_found = True
+
+        while improvement_found:
+            improvement_found = False
+
+            for idx, assignment in enumerate(best_assignments):
+                vessel_id = assignment.get('vessel_id')
+                vessel_data = self.vessel_lookup.get(vessel_id)
+
+                if not vessel_data:
+                    continue
+
+                allowed_ports = self.vessel_allowed_ports.get(vessel_id, [assignment.get('port_id')])
+                cargo_grade = vessel_data.get('cargo_grade')
+                compatible_plants = self._get_compatible_plants(cargo_grade) if cargo_grade else []
+
+                if not compatible_plants:
+                    continue
+
+                for port_id in allowed_ports:
+                    for plant_id in compatible_plants:
+                        candidate_assignment = self._build_assignment_record(vessel_id, vessel_data, port_id, plant_id)
+
+                        if candidate_assignment == assignment:
+                            continue
+
+                        trial_assignments = copy.deepcopy(best_assignments)
+                        trial_assignments[idx] = candidate_assignment
+                        trial_components = self._calculate_cost_components(trial_assignments)
+                        trial_cost = trial_components['total']
+
+                        if trial_cost + 1e-3 < best_cost:
+                            best_assignments = trial_assignments
+                            best_components = trial_components
+                            best_cost = trial_cost
+                            improvement_found = True
+                            break
+                    if improvement_found:
+                        break
+                if improvement_found:
+                    break
+
+        refined_solution = solution.copy()
+        refined_solution.update({
+            'assignments': best_assignments,
+            'cost_components': best_components,
+            'objective_value': best_cost
+        })
+        if refined_solution.get('status', '').startswith('GA'):
+            refined_solution['status'] = 'GA_Local_Search'
+        elif refined_solution.get('status', '').startswith('Greedy'):
+            refined_solution['status'] = 'Greedy_Local_Search'
+
+        return refined_solution
     
     def _parse_allowed_ports(self, vessel_row: Dict, primary_port: str) -> List[str]:
         allowed = [primary_port]
@@ -178,6 +413,9 @@ class HeuristicOptimizer:
             predicted_delay = self.predicted_delay_days.get(vessel_id, {}).get(port_id, 0.0)
             actual_berth_time = scheduled_day + predicted_delay
             planned_eta = float(vessel_data.get('eta_day', scheduled_day))
+            free_storage_days = self.port_lookup.get(port_id, {}).get('free_storage_days', 0)
+            dwell_days = max(0.0, actual_berth_time - planned_eta)
+            billable_storage_days = max(0.0, dwell_days - free_storage_days)
 
             assignment = {
                 'vessel_id': vessel_id,
@@ -190,7 +428,11 @@ class HeuristicOptimizer:
                 'actual_berth_time': actual_berth_time,
                 'planned_berth_time': planned_eta,
                 'predicted_delay_days': predicted_delay,
-                'rakes_required': int(np.ceil(vessel_data['cargo_mt'] / self.rake_capacity_mt))
+                'rakes_required': int(np.ceil(vessel_data['cargo_mt'] / self.rake_capacity_mt)),
+                'dwell_days': dwell_days,
+                'billable_storage_days': billable_storage_days,
+                'primary_port_id': self.primary_port_map.get(vessel_id, port_id),
+                'delay_days': dwell_days
             }
             assignments.append(assignment)
         
@@ -198,52 +440,10 @@ class HeuristicOptimizer:
     
     def _calculate_total_cost(self, assignments: List[Dict]) -> float:
         """Calculate total cost for assignments"""
-        total_cost = 0.0
-        
-        for assignment in assignments:
-            port_id = assignment.get('port_id')
-            plant_id = assignment['plant_id']
-            cargo_mt = assignment['cargo_mt']
-            vessel_id = assignment['vessel_id']
-            berth_time = assignment.get('actual_berth_time', assignment.get('berth_time'))
+        cost_components = self._calculate_cost_components(assignments)
 
-            # Ensure port is valid
-            port_info = self.port_lookup.get(port_id)
-            if port_info is None:
-                fallback_port = self.primary_port_map.get(vessel_id)
-                if fallback_port:
-                    port_info = self.port_lookup.get(fallback_port)
-                    if port_info is not None:
-                        port_id = fallback_port
-                        assignment['port_id'] = port_id
-            if port_info is None:
-                # Skip if no usable port info
-                continue
-            
-            # Port handling cost
-            port_cost = port_info['handling_cost_per_mt'] * cargo_mt
-
-            # Add secondary port penalty
-            primary_port = self.primary_port_map.get(vessel_id, port_id)
-            if port_id != primary_port:
-                port_cost += cargo_mt * self.secondary_port_penalty_per_mt
-            
-            # Rail transport cost
-            rail_cost = self._get_rail_cost(port_id, plant_id) * cargo_mt
-            
-            # Demurrage cost
-            vessel_eta = assignment.get('planned_berth_time', self.vessel_lookup[vessel_id]['eta_day'])
-            delay_days = max(0, float(berth_time) - float(vessel_eta)) if berth_time is not None else 0
-            demurrage_rate = self.vessel_lookup[vessel_id]['demurrage_rate']
-            demurrage_cost = delay_days * demurrage_rate
-            
-            total_cost += port_cost + rail_cost + demurrage_cost
-        
-        # Add penalty for constraint violations
         penalty = self._calculate_constraint_penalties(assignments)
-        total_cost += penalty
-        
-        return total_cost
+        return cost_components['total'] + penalty
     
     def _get_rail_cost(self, port_id: str, plant_id: str) -> float:
         """Get rail transport cost between port and plant"""
@@ -395,23 +595,51 @@ class HeuristicOptimizer:
         # Get best solution
         best_individual = tools.selBest(population, 1)[0]
         best_assignments = self._individual_to_assignments(best_individual)
-        
+        best_cost_components = self._calculate_cost_components(best_assignments)
+        best_cost = best_cost_components['total']
+
         solve_time = time.time() - start_time
-        
+
         seed_used = get_current_seed()
 
         result = {
             'status': 'GA_Optimized',
-            'objective_value': best_individual.fitness.values[0],
+            'objective_value': best_cost,
             'assignments': best_assignments,
             'solve_time': solve_time,
             'generations': generations,
             'population_size': population_size,
             'evolution_log': logbook,
-            'rng_seed': seed_used
+            'rng_seed': seed_used,
+            'cost_components': best_cost_components
         }
-        
-        print(f"GA completed in {solve_time:.2f}s - Best cost: ${result['objective_value']:,.2f}")
+
+        candidates = [result]
+
+        greedy_solution = self._construct_cost_greedy_solution()
+        if greedy_solution:
+            candidates.append(greedy_solution)
+
+        if seed_solution:
+            seed_assignments = seed_solution if isinstance(seed_solution, list) else []
+            if seed_assignments:
+                seed_cost_components = self._calculate_cost_components(seed_assignments)
+                candidates.append({
+                    'status': 'Seed_Feasible',
+                    'objective_value': seed_cost_components['total'],
+                    'assignments': seed_assignments,
+                    'solve_time': solve_time,
+                    'generations': generations,
+                    'population_size': population_size,
+                    'evolution_log': logbook,
+                    'rng_seed': seed_used,
+                    'cost_components': seed_cost_components
+                })
+
+        refined_candidates = [self._refine_with_local_search(candidate) for candidate in candidates]
+        result = min(refined_candidates, key=lambda sol: sol['objective_value'])
+
+        print(f"GA completed in {solve_time:.2f}s - Best cost: ₹{result['objective_value']:,.2f}")
         return result
     
     def _assignments_to_individual(self, assignments: List[Dict]) -> Optional[List[Tuple]]:

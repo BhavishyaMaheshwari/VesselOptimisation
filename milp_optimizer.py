@@ -11,6 +11,12 @@ import time
 import math
 import re
 
+from config import (
+    PORT_BENCHMARKS,
+    SECONDARY_PORT_PENALTY_PER_MT,
+    DEFAULT_RAKE_CAPACITY_MT,
+)
+
 class MILPOptimizer:
     """Mixed Integer Linear Programming optimizer for logistics dispatch"""
     
@@ -20,26 +26,31 @@ class MILPOptimizer:
         self.plants_df = data['plants']
         self.rail_costs_df = data['rail_costs']
         self.time_horizon = time_horizon_days
-        self.rake_capacity_mt = 5000  # Standard rake capacity
+        self.rake_capacity_mt = DEFAULT_RAKE_CAPACITY_MT
         
         # Create lookup dictionaries for faster access
         self.port_lookup = self.ports_df.set_index('port_id').to_dict('index')
         self.plant_lookup = self.plants_df.set_index('plant_id').to_dict('index')
         self.vessel_lookup = self.vessels_df.set_index('vessel_id').to_dict('index')
 
-        self.secondary_port_penalty_per_mt = 50.0
+        self.secondary_port_penalty_per_mt = SECONDARY_PORT_PENALTY_PER_MT
         self.secondary_port_bias_days = 0.25
 
         self.vessel_allowed_ports: Dict[str, List[str]] = {}
         self.primary_port_map: Dict[str, str] = {}
         self.port_daily_throughput: Dict[str, float] = {}
         self.vessel_service_day_limits: Dict[str, Dict[str, int]] = {}
+        self.vessel_freight_inr: Dict[str, float] = {}
+        self.port_storage_costs: Dict[str, float] = {}
+        self.port_free_days: Dict[str, int] = {}
 
         for vessel_id, vessel_data in self.vessel_lookup.items():
             primary_port = str(vessel_data['port_id']).strip()
             allowed_ports = self._parse_allowed_ports(vessel_data, primary_port)
             self.vessel_allowed_ports[vessel_id] = allowed_ports
             self.primary_port_map[vessel_id] = primary_port
+            freight_inr_per_mt = CostCalculator.get_freight_inr_per_mt(vessel_data)
+            self.vessel_freight_inr[vessel_id] = freight_inr_per_mt
 
         for port_id, port_data in self.port_lookup.items():
             daily_capacity = float(port_data.get('daily_capacity_mt', 0.0) or 0.0)
@@ -47,6 +58,13 @@ class MILPOptimizer:
             rake_capacity = rakes_available * self.rake_capacity_mt
             throughput = min(daily_capacity, rake_capacity) if daily_capacity and rake_capacity else max(daily_capacity, rake_capacity)
             self.port_daily_throughput[port_id] = max(1.0, throughput)
+            benchmark = PORT_BENCHMARKS.get(port_id)
+            if benchmark:
+                self.port_storage_costs[port_id] = benchmark.storage_cost_per_mt_per_day
+                self.port_free_days[port_id] = benchmark.free_storage_days
+            else:
+                self.port_storage_costs[port_id] = float(port_data.get('storage_cost_per_mt_per_day', 0.0) or 0.0)
+                self.port_free_days[port_id] = int(port_data.get('free_storage_days', 0) or 0)
 
         for vessel_id, vessel_data in self.vessel_lookup.items():
             cargo_mt = float(vessel_data.get('cargo_mt', 0.0) or 0.0)
@@ -59,7 +77,6 @@ class MILPOptimizer:
                 else:
                     service_days = int(math.ceil(cargo_mt / port_throughput))
 
-                # Provide a small scheduling buffer while respecting horizon limits
                 buffered_days = min(self.time_horizon, max(1, service_days + 1))
                 self.vessel_service_day_limits[vessel_id][port_id] = buffered_days
 
@@ -146,8 +163,19 @@ class MILPOptimizer:
         
         # Auxiliary variables for costs
         demurrage_cost = pulp.LpVariable.dicts("demurrage", vessels, lowBound=0)
+        storage_days = pulp.LpVariable.dicts(
+            "storage_days",
+            [(v, p) for v in vessels for p in ports],
+            lowBound=0,
+            cat='Continuous'
+        )
         
         # Objective Function: Minimize total cost
+        ocean_freight_cost = pulp.lpSum([
+            x[v, p, pl, t] * self.vessel_freight_inr.get(v, 0.0)
+            for v in vessels for p in ports for pl in plants for t in time_periods
+        ])
+
         port_handling_cost = pulp.lpSum([
             x[v, p, pl, t] * self.port_lookup[p]['handling_cost_per_mt']
             for v in vessels for p in ports for pl in plants for t in time_periods
@@ -159,17 +187,20 @@ class MILPOptimizer:
         ])
         
         total_demurrage = pulp.lpSum([demurrage_cost[v] for v in vessels])
-        
-        secondary_preference_cost = pulp.lpSum([
-            x[v, p, pl, t] * self.secondary_port_penalty_per_mt
-            for v in vessels
-            for p in ports
-            if p in self.vessel_allowed_ports.get(v, []) and p != self.primary_port_map.get(v)
-            for pl in plants
-            for t in time_periods
+
+        storage_cost = pulp.lpSum([
+            storage_days[v, p] * self.vessel_lookup[v]['cargo_mt'] * self.port_storage_costs.get(p, 0.0)
+            for v in vessels for p in ports
         ])
 
-        prob += port_handling_cost + rail_transport_cost + total_demurrage + secondary_preference_cost
+        rerouting_penalty = pulp.lpSum([
+            self.vessel_lookup[v]['cargo_mt'] * self.secondary_port_penalty_per_mt * u[v, p]
+            for v in vessels
+            for p in self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)])
+            if p is not None and p != self.primary_port_map.get(v)
+        ])
+
+        prob += ocean_freight_cost + port_handling_cost + rail_transport_cost + total_demurrage + storage_cost + rerouting_penalty
         
         # Constraints
         
@@ -211,6 +242,9 @@ class MILPOptimizer:
             for p in allowed_ports:
                 service_limit = self.vessel_service_day_limits.get(v, {}).get(p, 1)
                 prob += pulp.lpSum([y[v, p, t] for t in time_periods]) <= service_limit * u[v, p]
+                free_days = self.port_free_days.get(p, 0)
+                prob += storage_days[v, p] >= pulp.lpSum([y[v, p, t] for t in time_periods]) - free_days * u[v, p]
+                prob += storage_days[v, p] <= self.time_horizon * u[v, p]
 
             for t in time_periods:
                 prob += pulp.lpSum([y[v, p, t] for p in allowed_ports]) <= 1
@@ -277,6 +311,7 @@ class MILPOptimizer:
             'cargo_flow': x,
             'vessel_berth': y, 
             'vessel_port_choice': u,
+            'storage_days': storage_days,
             'rake_assignment': z,
             'demurrage_cost': demurrage_cost
         }
@@ -358,6 +393,7 @@ class MILPOptimizer:
         
         cargo_flow = variables['cargo_flow']
         vessel_berth = variables['vessel_berth']
+        storage_days_var = variables.get('storage_days', {})
         
         for v in self.vessels_df['vessel_id']:
             for p in self.ports_df['port_id']:
@@ -378,6 +414,10 @@ class MILPOptimizer:
                         predicted_delay = float(self.predicted_delay_days.get(v, {}).get(p, 0.0))
                         planned_eta = float(self.vessel_lookup[v]['eta_day'])
                         actual_berth_time = float(scheduled_day + predicted_delay)
+                        billable_storage_days = float(pulp.value(storage_days_var.get((v, p), 0)) or 0.0)
+                        delay_days = max(0.0, actual_berth_time - planned_eta)
+                        free_days = self.port_free_days.get(p, 0)
+                        dwell_days = billable_storage_days + free_days if billable_storage_days > 0 else max(predicted_delay, delay_days)
 
                         assignment = {
                             'vessel_id': v,
@@ -391,7 +431,11 @@ class MILPOptimizer:
                             'planned_berth_time': planned_eta,
                             'predicted_delay_days': predicted_delay,
                             'rakes_required': int(math.ceil(cargo_amount / self.rake_capacity_mt)),
-                            'eta_day': planned_eta
+                            'eta_day': planned_eta,
+                            'primary_port_id': self.primary_port_map.get(v),
+                            'billable_storage_days': round(billable_storage_days, 2),
+                            'dwell_days': round(dwell_days, 2),
+                            'delay_days': round(delay_days, 2)
                         }
                         assignments.append(assignment)
         
@@ -500,7 +544,8 @@ class MILPOptimizer:
                 berth_time = assignment.get('berth_time', assignment.get('time_period', 0))
             
             # Port handling cost
-            port_cost = self.port_lookup[port_id]['handling_cost_per_mt'] * cargo_mt
+            port_data = self.port_lookup[port_id]
+            port_cost = port_data['handling_cost_per_mt'] * cargo_mt
             
             # Rail transport cost
             rail_cost = self._get_rail_cost(port_id, plant_id) * cargo_mt
@@ -513,11 +558,32 @@ class MILPOptimizer:
             # Calculate delay in days (berth time - planned ETA)
             delay_days = max(0, float(berth_time) - vessel_eta) if berth_time is not None else 0
             demurrage_cost = delay_days * demurrage_rate
+
+            # Storage cost using dwell minus free days
+            storage_rate = float(port_data.get('storage_cost_per_mt_per_day', 0.0) or 0.0)
+            free_days = float(port_data.get('free_storage_days', 0.0) or 0.0)
+            benchmark = PORT_BENCHMARKS.get(port_id)
+            if storage_rate <= 0 and benchmark:
+                storage_rate = benchmark.storage_cost_per_mt_per_day
+            if free_days <= 0 and benchmark:
+                free_days = benchmark.free_storage_days
+            dwell_days = float(assignment.get('dwell_days', delay_days) or 0.0)
+            billable_days = max(0.0, float(assignment.get('billable_storage_days', dwell_days - free_days)) or 0.0)
+            storage_cost = cargo_mt * billable_days * storage_rate
+
+            ocean_freight = cargo_mt * self.vessel_freight_inr.get(vessel_id, 0.0)
             
             secondary_penalty = 0.0
             if port_id != self.primary_port_map.get(vessel_id):
                 secondary_penalty = cargo_mt * self.secondary_port_penalty_per_mt
 
-            total_cost += port_cost + rail_cost + demurrage_cost + secondary_penalty
+            total_cost += (
+                port_cost +
+                rail_cost +
+                demurrage_cost +
+                secondary_penalty +
+                storage_cost +
+                ocean_freight
+            )
         
         return total_cost
