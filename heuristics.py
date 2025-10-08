@@ -10,8 +10,10 @@ from deap import base, creator, tools, algorithms
 import copy
 import time
 import math
+import re
 
 from utils import ETAPredictor
+from seed_utils import get_current_seed
 
 class HeuristicOptimizer:
     """Heuristic optimization using GA and Simulated Annealing"""
@@ -31,20 +33,55 @@ class HeuristicOptimizer:
         # DEAP setup will be done when needed
         self.toolbox = None
 
+        self.secondary_port_penalty_per_mt = 50.0
+        self.vessel_allowed_ports: Dict[str, List[str]] = {}
+        self.primary_port_map: Dict[str, str] = {}
+
+        for vessel_id, vessel_data in self.vessel_lookup.items():
+            primary_port = str(vessel_data['port_id']).strip()
+            allowed_ports = self._parse_allowed_ports(vessel_data, primary_port)
+            self.vessel_allowed_ports[vessel_id] = allowed_ports
+            self.primary_port_map[vessel_id] = primary_port
+
         # Pre-compute predicted delays for each vessel (in days)
         self.eta_predictor = ETAPredictor()
-        self.predicted_delay_days: Dict[str, float] = {}
+        self.predicted_delay_days: Dict[str, Dict[str, float]] = {}
         for vessel_id, vessel_data in self.vessel_lookup.items():
-            try:
-                delay_hours = self.eta_predictor.predict_delay(
-                    vessel_id=vessel_id,
-                    port_id=vessel_data['port_id'],
-                    base_eta=float(vessel_data['eta_day'])
-                )
-                self.predicted_delay_days[vessel_id] = max(0.0, delay_hours / 24.0)
-            except Exception:
-                self.predicted_delay_days[vessel_id] = 0.0
+            eta_day = float(vessel_data['eta_day'])
+            delay_map: Dict[str, float] = {}
+            for port_id in self.vessel_allowed_ports[vessel_id]:
+                try:
+                    delay_hours = self.eta_predictor.predict_delay(
+                        vessel_id=vessel_id,
+                        port_id=port_id,
+                        base_eta=eta_day
+                    )
+                    delay_map[port_id] = max(0.0, delay_hours / 24.0)
+                except Exception:
+                    delay_map[port_id] = 0.0
+            self.predicted_delay_days[vessel_id] = delay_map
     
+    def _parse_allowed_ports(self, vessel_row: Dict, primary_port: str) -> List[str]:
+        allowed = [primary_port]
+        secondary_value = vessel_row.get('secondary_port_id')
+        if secondary_value is None:
+            return allowed
+
+        if isinstance(secondary_value, (float, int)) and pd.isna(secondary_value):
+            return allowed
+
+        if isinstance(secondary_value, str):
+            tokens = [tok.strip().upper() for tok in re.split(r'[|;,]+', secondary_value) if tok.strip()]
+        elif isinstance(secondary_value, (list, tuple, set)):
+            tokens = [str(tok).strip().upper() for tok in secondary_value if str(tok).strip()]
+        else:
+            tokens = [str(secondary_value).strip().upper()]
+
+        for token in tokens:
+            if token and token not in allowed and token in self.port_lookup:
+                allowed.append(token)
+        return allowed
+
     def _setup_deap(self):
         """Setup DEAP framework for genetic algorithm"""
         # Clear any existing creators
@@ -76,7 +113,7 @@ class HeuristicOptimizer:
         
         self.toolbox = base.Toolbox()
         
-        # Individual representation: list of (vessel_id, plant_id, berth_day)
+    # Individual representation: list of (vessel_id, port_id, plant_id, berth_day)
         self.toolbox.register("individual", self._create_individual)
         self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
         self.toolbox.register("evaluate", self._evaluate_individual)
@@ -91,8 +128,12 @@ class HeuristicOptimizer:
         for _, vessel in self.vessels_df.iterrows():
             vessel_id = vessel['vessel_id']
             cargo_grade = vessel['cargo_grade']
-            eta_day = vessel['eta_day']
-            
+            eta_day = float(vessel['eta_day'])
+
+            allowed_ports = self.vessel_allowed_ports.get(vessel_id, [vessel['port_id']])
+            if not allowed_ports:
+                continue
+
             # Find compatible plants
             compatible_plants = self.plants_df[
                 self.plants_df['quality_requirements'] == cargo_grade
@@ -100,9 +141,12 @@ class HeuristicOptimizer:
             
             if compatible_plants:
                 plant_id = random.choice(compatible_plants)
+                port_id = allowed_ports[0]
+                if len(allowed_ports) > 1 and random.random() < 0.15:
+                    port_id = random.choice(allowed_ports)
                 # Berth day can be ETA or later (up to 7 days delay)
                 berth_day = eta_day + random.uniform(0, 7)
-                individual.append((vessel_id, plant_id, berth_day))
+                individual.append((vessel_id, port_id, plant_id, berth_day))
         
         return creator.Individual(individual)
     
@@ -116,8 +160,13 @@ class HeuristicOptimizer:
         """Convert GA individual to assignment format"""
         assignments = []
         
-        for vessel_id, plant_id, berth_day in individual:
+        for vessel_id, port_id, plant_id, berth_day in individual:
             vessel_data = self.vessel_lookup[vessel_id]
+            allowed_ports = self.vessel_allowed_ports.get(vessel_id, [vessel_data['port_id']])
+            if not allowed_ports:
+                continue
+            if port_id not in allowed_ports:
+                port_id = allowed_ports[0]
 
             # Safe handling of berth_day (can be None in hybrid methods)
             if berth_day is None:
@@ -126,13 +175,13 @@ class HeuristicOptimizer:
                 safe_berth_day = float(berth_day)
 
             scheduled_day = safe_berth_day
-            predicted_delay = self.predicted_delay_days.get(vessel_id, 0.0)
+            predicted_delay = self.predicted_delay_days.get(vessel_id, {}).get(port_id, 0.0)
             actual_berth_time = scheduled_day + predicted_delay
             planned_eta = float(vessel_data.get('eta_day', scheduled_day))
 
             assignment = {
                 'vessel_id': vessel_id,
-                'port_id': vessel_data['port_id'],
+                'port_id': port_id,
                 'plant_id': plant_id,
                 'time_period': int(math.ceil(scheduled_day)),
                 'scheduled_day': scheduled_day,
@@ -152,14 +201,32 @@ class HeuristicOptimizer:
         total_cost = 0.0
         
         for assignment in assignments:
-            port_id = assignment['port_id']
+            port_id = assignment.get('port_id')
             plant_id = assignment['plant_id']
             cargo_mt = assignment['cargo_mt']
             vessel_id = assignment['vessel_id']
             berth_time = assignment.get('actual_berth_time', assignment.get('berth_time'))
+
+            # Ensure port is valid
+            port_info = self.port_lookup.get(port_id)
+            if port_info is None:
+                fallback_port = self.primary_port_map.get(vessel_id)
+                if fallback_port:
+                    port_info = self.port_lookup.get(fallback_port)
+                    if port_info is not None:
+                        port_id = fallback_port
+                        assignment['port_id'] = port_id
+            if port_info is None:
+                # Skip if no usable port info
+                continue
             
             # Port handling cost
-            port_cost = self.port_lookup[port_id]['handling_cost_per_mt'] * cargo_mt
+            port_cost = port_info['handling_cost_per_mt'] * cargo_mt
+
+            # Add secondary port penalty
+            primary_port = self.primary_port_map.get(vessel_id, port_id)
+            if port_id != primary_port:
+                port_cost += cargo_mt * self.secondary_port_penalty_per_mt
             
             # Rail transport cost
             rail_cost = self._get_rail_cost(port_id, plant_id) * cargo_mt
@@ -246,17 +313,21 @@ class HeuristicOptimizer:
         
         # Mutate random gene
         idx = random.randint(0, len(individual) - 1)
-        vessel_id, plant_id, berth_day = individual[idx]
+        vessel_id, port_id, plant_id, berth_day = individual[idx]
         
         # Get vessel info
         vessel_data = self.vessel_lookup[vessel_id]
         cargo_grade = vessel_data['cargo_grade']
         eta_day = vessel_data['eta_day']
+        allowed_ports = self.vessel_allowed_ports.get(
+            vessel_id,
+            [self.primary_port_map.get(vessel_id, port_id) or port_id]
+        )
         
         # Mutation type
-        mutation_type = random.choice(['plant', 'time', 'both'])
+        mutation_type = random.choice(['plant', 'time', 'port', 'plant_time'])
         
-        if mutation_type in ['plant', 'both']:
+        if mutation_type in ['plant', 'plant_time']:
             # Change plant assignment
             compatible_plants = self.plants_df[
                 self.plants_df['quality_requirements'] == cargo_grade
@@ -264,11 +335,22 @@ class HeuristicOptimizer:
             if compatible_plants:
                 plant_id = random.choice(compatible_plants)
         
-        if mutation_type in ['time', 'both']:
+        if mutation_type == 'port' and allowed_ports:
+            other_ports = [p for p in allowed_ports if p != port_id]
+            primary_port = self.primary_port_map.get(vessel_id)
+            if other_ports:
+                if primary_port and random.random() < 0.5:
+                    port_id = primary_port
+                else:
+                    port_id = random.choice(other_ports)
+            elif primary_port:
+                port_id = primary_port
+
+        if mutation_type in ['time', 'plant_time']:
             # Change berth time
             berth_day = eta_day + random.uniform(0, 10)
-        
-        individual[idx] = (vessel_id, plant_id, berth_day)
+
+        individual[idx] = (vessel_id, port_id, plant_id, berth_day)
         return (individual,)
     
     def run_genetic_algorithm(self, population_size: int = 50, generations: int = 100,
@@ -316,6 +398,8 @@ class HeuristicOptimizer:
         
         solve_time = time.time() - start_time
         
+        seed_used = get_current_seed()
+
         result = {
             'status': 'GA_Optimized',
             'objective_value': best_individual.fitness.values[0],
@@ -323,7 +407,8 @@ class HeuristicOptimizer:
             'solve_time': solve_time,
             'generations': generations,
             'population_size': population_size,
-            'evolution_log': logbook
+            'evolution_log': logbook,
+            'rng_seed': seed_used
         }
         
         print(f"GA completed in {solve_time:.2f}s - Best cost: ${result['objective_value']:,.2f}")
@@ -336,8 +421,24 @@ class HeuristicOptimizer:
             for assignment in assignments:
                 vessel_id = assignment['vessel_id']
                 plant_id = assignment['plant_id']
-                berth_time = assignment.get('berth_time', assignment.get('time_period', 1))
-                individual.append((vessel_id, plant_id, berth_time))
+                port_id = assignment.get('port_id')
+                if port_id is None:
+                    port_id = self.primary_port_map.get(
+                        vessel_id,
+                        self.vessel_allowed_ports.get(vessel_id, [None])[0]
+                    )
+
+                berth_time = assignment.get('berth_time')
+                if berth_time is None:
+                    berth_time = assignment.get('scheduled_day')
+                if berth_time is None:
+                    time_period = assignment.get('time_period')
+                    if time_period is not None:
+                        berth_time = float(time_period)
+                    else:
+                        berth_time = float(self.vessel_lookup[vessel_id].get('eta_day', 0))
+
+                individual.append((vessel_id, port_id, plant_id, berth_time))
             return individual
         except Exception as e:
             print(f"Error converting assignments to individual: {e}")
@@ -392,6 +493,8 @@ class HeuristicOptimizer:
         
         solve_time = time.time() - start_time
         
+        seed_used = get_current_seed()
+
         result = {
             'status': 'SA_Refined',
             'objective_value': best_cost,
@@ -399,7 +502,8 @@ class HeuristicOptimizer:
             'solve_time': solve_time,
             'iterations': max_iterations,
             'initial_cost': initial_solution['objective_value'],
-            'improvement': initial_solution['objective_value'] - best_cost
+            'improvement': initial_solution['objective_value'] - best_cost,
+            'rng_seed': seed_used
         }
         
         print(f"SA completed in {solve_time:.2f}s - Final cost: ${best_cost:,.2f}")
@@ -422,7 +526,7 @@ class HeuristicOptimizer:
         eta_day = vessel_data['eta_day']
         
         # Choose modification type
-        modification = random.choice(['plant', 'time'])
+        modification = random.choice(['plant', 'time', 'port'])
         
         if modification == 'plant':
             # Change plant assignment
@@ -436,13 +540,48 @@ class HeuristicOptimizer:
                 if new_plants:
                     assignment['plant_id'] = random.choice(new_plants)
         
+        elif modification == 'port':
+            allowed_ports = self.vessel_allowed_ports.get(
+                vessel_id,
+                [self.primary_port_map.get(vessel_id, assignment['port_id']) or assignment['port_id']]
+            )
+            if allowed_ports:
+                current_port = assignment['port_id']
+                alternative_ports = [p for p in allowed_ports if p != current_port]
+                primary_port = self.primary_port_map.get(vessel_id)
+
+                chosen_port = current_port
+                if alternative_ports:
+                    if primary_port and random.random() < 0.5:
+                        chosen_port = primary_port
+                    else:
+                        chosen_port = random.choice(alternative_ports)
+                elif primary_port:
+                    chosen_port = primary_port
+
+                if chosen_port != current_port:
+                    assignment['port_id'] = chosen_port
+                    scheduled_day = assignment.get('scheduled_day', assignment.get('time_period', eta_day))
+                    if scheduled_day is None:
+                        scheduled_day = eta_day
+                    new_delay = self.predicted_delay_days.get(vessel_id, {}).get(chosen_port, 0.0)
+                    actual_berth = scheduled_day + new_delay
+                    assignment['predicted_delay_days'] = new_delay
+                    assignment['berth_time'] = actual_berth
+                    assignment['actual_berth_time'] = actual_berth
+                    assignment['time_period'] = int(math.ceil(scheduled_day))
+
         elif modification == 'time':
             # Change scheduled berth day (±2 days) respecting ETA
             current_schedule = assignment.get('scheduled_day', assignment.get('time_period', eta_day))
             if current_schedule is None:
                 current_schedule = eta_day
             new_schedule = max(eta_day, float(current_schedule) + random.uniform(-2, 2))
-            predicted_delay = assignment.get('predicted_delay_days', self.predicted_delay_days.get(vessel_id, 0.0))
+            current_port = assignment['port_id']
+            predicted_delay = assignment.get(
+                'predicted_delay_days',
+                self.predicted_delay_days.get(vessel_id, {}).get(current_port, 0.0)
+            )
             actual_berth = new_schedule + predicted_delay
 
             assignment['scheduled_day'] = new_schedule

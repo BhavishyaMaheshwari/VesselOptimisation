@@ -4,6 +4,7 @@ Production-quality web interface with interactive optimization and visualization
 """
 import dash
 from dash import dcc, html, Input, Output, State, callback_context, dash_table
+from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -22,6 +23,7 @@ from heuristics import HeuristicOptimizer
 from simulation import LogisticsSimulator
 from visuals import LogisticsVisualizer
 from utils import ETAPredictor, ScenarioGenerator, calculate_kpis, format_currency
+from seed_utils import reseed_for_phase, set_global_seed
 
 app = dash.Dash(
     __name__,
@@ -32,6 +34,9 @@ app = dash.Dash(
 )
 
 app.title = "SIH Logistics Optimization Simulator"
+
+# Establish a deterministic baseline seed for all stochastic components.
+BASE_RANDOM_SEED = set_global_seed(quiet=True)
 
 # Global variables for storing data and results
 current_data = None
@@ -470,6 +475,7 @@ def create_main_content():
             dbc.Tabs(
                 id="main-tabs",
                 active_tab="overview",
+                className="tabs-with-export",
                 children=[
                     dbc.Tab(label="Overview", tab_id="overview"),
                     dbc.Tab(label="Gantt & Schedules", tab_id="gantt"),
@@ -477,7 +483,12 @@ def create_main_content():
                     dbc.Tab(label="Rake Dashboard", tab_id="rakes"),
                     dbc.Tab(label="Simulation Comparator", tab_id="simcompare"),
                     dbc.Tab(label="Scenario Analysis", tab_id="whatif"),
-                    dbc.Tab(label="Logs & Export", tab_id="logs")
+                    dbc.Tab(
+                        label="Logs & Export",
+                        tab_id="logs",
+                        tabClassName="ms-auto",
+                        tab_style={"whiteSpace": "nowrap"}
+                    )
                 ]
             )
         ]),
@@ -773,6 +784,29 @@ app.layout = dbc.Container([
     html.Div(id="stored-solution", style={"display": "none"}),
     html.Div(id="stored-simulation", style={"display": "none"}),
 
+    dbc.Modal(
+        [
+            dbc.ModalHeader(
+                dbc.ModalTitle("Scenario comparison overview"),
+                close_button=False
+            ),
+            dbc.ModalBody([
+                html.Div(id="modal-scenario-summary", className="mb-3"),
+                dcc.Graph(id="modal-scenario-chart", style={"height": "320px"}),
+                html.Div(id="modal-scenario-meta", className="small mt-3")
+            ]),
+            dbc.ModalFooter(
+                dbc.Button("Close", id="scenario-modal-close", color="secondary")
+            )
+        ],
+        id="scenario-comparison-modal",
+        is_open=False,
+        size="xl",
+        centered=True,
+        scrollable=True,
+        backdrop="static"
+    ),
+
     # Download targets (kept global so buttons work from any tab)
     dcc.Download(id="download-dispatch-csv-file"),
     dcc.Download(id="download-sap-file"),
@@ -807,7 +841,10 @@ def load_data(load_sample_clicks, upload_contents, upload_filenames):
     
     if trigger_id == "load-sample-btn" and load_sample_clicks:
         # Load sample data
+        set_global_seed(BASE_RANDOM_SEED, quiet=True)
         current_data = DataLoader.get_toy_dataset()
+        # Restore the base seed so downstream stages start from the same RNG state
+        set_global_seed(BASE_RANDOM_SEED, quiet=True)
         
         status = dbc.Alert("Sample data loaded successfully.", color="success")
         
@@ -1012,6 +1049,14 @@ def run_optimization(baseline_clicks, optimized_clicks, stored_data, opt_method,
         return None, "", "light", {"display": "none"}
     
     trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
+
+    # Reset RNGs so repeated runs with the same data stay deterministic.
+    set_global_seed(BASE_RANDOM_SEED, quiet=True)
+    phase_label = {
+        "run-baseline-btn": "baseline",
+        "run-optimized-btn": "optimized"
+    }.get(trigger_id, "optimization")
+    active_seed = reseed_for_phase(f"optimization::{phase_label}", quiet=True)
     opt_method = (opt_method or "milp").lower()
     solver = (solver or "CBC").upper()
     try:
@@ -1049,6 +1094,7 @@ def run_optimization(baseline_clicks, optimized_clicks, stored_data, opt_method,
             
             milp_optimizer = MILPOptimizer(data)
             solution = milp_optimizer.create_baseline_solution()
+            solution['rng_seed'] = active_seed
             solution = attach_solution_kpis(solution, data)
             solution = make_json_safe(solution)
             baseline_solution = solution
@@ -1100,6 +1146,8 @@ def run_optimization(baseline_clicks, optimized_clicks, stored_data, opt_method,
                     ga_solution, max_iterations=500
                 )
             
+            if isinstance(solution, dict):
+                solution['rng_seed'] = active_seed
             solution = attach_solution_kpis(solution, data)
             solution = make_json_safe(solution)
             current_solution = solution
@@ -1160,6 +1208,9 @@ def run_simulation(simulation_clicks, stored_data, stored_solution):
     if not simulation_clicks or not stored_data or not stored_solution:
         return None, "", "light", {"display": "none"}
 
+    set_global_seed(BASE_RANDOM_SEED, quiet=True)
+    active_seed = reseed_for_phase("simulation", quiet=True)
+
     try:
         data = get_data_frames(stored_data)
         solution = parse_solution_payload(stored_solution)
@@ -1176,6 +1227,8 @@ def run_simulation(simulation_clicks, stored_data, stored_solution):
         simulator = LogisticsSimulator(data, time_step_hours=6)
         simulation_results = simulator.run_simulation(assignments, simulation_days=30)
         simulation_results = make_json_safe(simulation_results)
+        if isinstance(simulation_results, dict):
+            simulation_results['rng_seed'] = active_seed
 
         current_simulation = simulation_results
 
@@ -1683,61 +1736,100 @@ def update_schedule_info(stored_solution, stored_data):
     except Exception as e:
         return f"Error: {str(e)}", f"Error: {str(e)}"
 
-@app.callback(
-    [Output("scenario-comparison-summary", "children"),
-     Output("scenario-comparison-chart", "figure")],
-    [Input("stored-solution", "children"),
-     Input("compare-scenarios-btn", "n_clicks")]
-)
-def update_scenario_comparison(stored_solution, compare_clicks):
-    """Compare baseline vs optimized scenarios"""
+def prepare_scenario_comparison(stored_solution):
+    """Compute scenario comparison artefacts for reuse across callbacks."""
+    placeholder_fig = go.Figure().add_annotation(
+        text="Run baseline and optimized plans to compare",
+        xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False
+    )
+    placeholder_fig.update_layout(
+        template="plotly_white",
+        height=360,
+        showlegend=False,
+        margin=dict(l=60, r=40, t=70, b=60)
+    )
+
     if not stored_solution:
-        msg = html.P("Run baseline and optimized solutions to compare scenarios", className="text-muted text-center p-4")
-        fig = go.Figure().add_annotation(
-            text="Run optimizations to see comparison",
-            xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False
+        summary = html.P(
+            "Run baseline and optimized solutions to unlock the scenario comparison dashboard.",
+            className="text-muted text-center mb-0"
         )
-        return msg, fig
-    
+        meta = html.Div(
+            "Tip: Generate the baseline plan first, then run an optimized plan for a like-for-like view.",
+            className="text-muted small mt-2"
+        )
+        return {"summary": summary, "figure": placeholder_fig, "meta": meta, "ready": False}
+
     try:
-        solution = json.loads(stored_solution)
-        
-        # Build comparison data
-        scenarios = []
-        costs = []
-        vessels = []
-        
+        if isinstance(stored_solution, str):
+            json.loads(stored_solution)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        message = "Unable to read the stored plan for comparison."
+        summary = dbc.Alert(message, color="danger", className="mb-0")
+        error_fig = go.Figure().add_annotation(
+            text=message,
+            xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+            font=dict(color="red")
+        )
+        error_fig.update_layout(
+            template="plotly_white",
+            height=360,
+            showlegend=False,
+            margin=dict(l=60, r=40, t=70, b=60)
+        )
+        meta = html.Div(
+            "Re-run the optimization workflow to refresh the stored plan before comparing scenarios.",
+            className="text-danger small mt-2"
+        )
+        return {"summary": summary, "figure": error_fig, "meta": meta, "ready": False}
+
+    try:
+        global baseline_solution, current_solution
+
+        scenarios: List[str] = []
+        costs: List[float] = []
+        vessels: List[int] = []
+
         if baseline_solution:
-            scenarios.append('Baseline (FCFS)')
-            costs.append(baseline_solution.get('objective_value', 0))
-            vessels.append(len(baseline_solution.get('assignments', [])))
-        
+            scenarios.append("Baseline (FCFS)")
+            costs.append(float(baseline_solution.get("objective_value", 0) or 0))
+            vessels.append(len(baseline_solution.get("assignments", [])))
+
         if current_solution:
-            scenarios.append('Optimized (AI)')
-            costs.append(current_solution.get('objective_value', 0))
-            vessels.append(len(current_solution.get('assignments', [])))
-        
+            scenarios.append("Optimized (AI)")
+            costs.append(float(current_solution.get("objective_value", 0) or 0))
+            vessels.append(len(current_solution.get("assignments", [])))
+
         if len(scenarios) < 2:
-            msg = html.Div([
-                dbc.Alert("Run both Baseline and Optimized to see full comparison", color="warning"),
-                html.P(f"Currently have: {', '.join(scenarios) if scenarios else 'None'}")
-            ])
-            fig = go.Figure().add_annotation(
-                text="Run both baseline and optimized solutions",
-                xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False
+            summary = dbc.Alert(
+                [
+                    html.H6("Need both scenarios", className="alert-heading"),
+                    html.P(
+                        "Run the baseline and optimized plans to unlock the side-by-side comparison.",
+                        className="mb-1"
+                    ),
+                    html.Small(
+                        f"Currently available: {', '.join(scenarios) if scenarios else 'None'}",
+                        className="text-muted"
+                    )
+                ],
+                color="warning",
+                className="mb-0"
             )
-            return msg, fig
-        
-        # Summary cards
-        baseline_cost = costs[0] if len(costs) > 0 else 0
-        optimized_cost = costs[1] if len(costs) > 1 else 0
+            meta = html.Div(
+                "Once both plans are solved, this view will quantify savings and throughput deltas automatically.",
+                className="text-muted small mt-2"
+            )
+            return {"summary": summary, "figure": placeholder_fig, "meta": meta, "ready": False}
+
+        baseline_cost = costs[0]
+        optimized_cost = costs[1]
         savings = baseline_cost - optimized_cost
         savings_pct = (savings / baseline_cost * 100) if baseline_cost > 0 else 0
-        
-        # Sanity check and display appropriate message
+
         savings_color = "success"
         savings_text = f"{savings_pct:.1f}% reduction"
-        
+
         if baseline_cost <= 0:
             savings_text = "Invalid baseline cost"
             savings_color = "danger"
@@ -1747,7 +1839,7 @@ def update_scenario_comparison(stored_solution, compare_clicks):
         elif savings_pct > 95:
             savings_text = f"~{min(savings_pct, 99):.0f}% reduction (exceptional!)"
             savings_color = "warning"
-        
+
         summary = dbc.Row([
             dbc.Col([
                 dbc.Card([
@@ -1777,60 +1869,127 @@ def update_scenario_comparison(stored_solution, compare_clicks):
                 ])
             ], width=4)
         ])
-        
-        # Create comparison chart
+
         fig = make_subplots(
             rows=1, cols=2,
-            subplot_titles=('Cost Comparison', 'Vessel Utilization'),
-            specs=[[{'type': 'bar'}, {'type': 'bar'}]]
+            subplot_titles=("Cost Comparison", "Vessel Utilization"),
+            specs=[[{"type": "bar"}, {"type": "bar"}]]
         )
-        
-        # Cost comparison
+
         fig.add_trace(
             go.Bar(
                 x=scenarios,
                 y=costs,
-                marker=dict(color=['#6c757d', '#28a745']),
+                marker=dict(color=["#6c757d", "#28a745"]),
                 text=[format_currency(c) for c in costs],
-                textposition='outside',
-                name='Cost'
+                textposition="outside",
+                name="Cost"
             ),
             row=1, col=1
         )
-        
-        # Vessel utilization
+
         fig.add_trace(
             go.Bar(
                 x=scenarios,
                 y=vessels,
-                marker=dict(color=['#ffc107', '#007bff']),
+                marker=dict(color=["#ffc107", "#007bff"]),
                 text=vessels,
-                textposition='outside',
-                name='Vessels'
+                textposition="outside",
+                name="Vessels"
             ),
             row=1, col=2
         )
-        
+
         fig.update_layout(
             height=450,
             showlegend=False,
-            title_text="Scenario Analysis Dashboard"
+            title_text="Scenario Analysis Dashboard",
+            template="plotly_white",
+            margin=dict(l=60, r=40, t=70, b=60)
         )
-        
         fig.update_yaxes(title_text="Total Cost (₹)", row=1, col=1)
         fig.update_yaxes(title_text="Vessels Processed", row=1, col=2)
-        
-        return summary, fig
-        
-    except Exception as e:
-        print(f"Scenario comparison error: {e}")
-        msg = html.P(f"Error: {str(e)}", className="text-danger")
-        fig = go.Figure().add_annotation(
-            text=f"Error: {str(e)}",
+
+        meta = html.Div([
+            html.Span("Savings vs baseline:", className="text-muted me-1"),
+            html.Span(
+                f"{format_currency(savings)} ({savings_text})",
+                className=f"text-{savings_color} fw-semibold"
+            ),
+            html.Br(),
+            html.Span(
+                f"Baseline: {format_currency(baseline_cost)} | Optimized: {format_currency(optimized_cost)}",
+                className="text-muted"
+            ),
+            html.Br(),
+            html.Span(
+                f"Vessels served: {vessels[0]} → {vessels[1]}",
+                className="text-muted"
+            )
+        ], className="small mt-2")
+
+        return {"summary": summary, "figure": fig, "meta": meta, "ready": True}
+
+    except Exception as exc:
+        print(f"Scenario comparison error: {exc}")
+        summary = dbc.Alert(f"Error while preparing comparison: {exc}", color="danger", className="mb-0")
+        error_fig = go.Figure().add_annotation(
+            text=f"Error: {exc}",
             xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
             font=dict(color="red")
         )
-        return msg, fig
+        error_fig.update_layout(
+            template="plotly_white",
+            height=360,
+            showlegend=False,
+            margin=dict(l=60, r=40, t=70, b=60)
+        )
+        meta = html.Div(
+            "Inspect the logs tab for more detail, then re-run the planning workflow.",
+            className="text-danger small mt-2"
+        )
+        return {"summary": summary, "figure": error_fig, "meta": meta, "ready": False}
+
+
+@app.callback(
+    [Output("scenario-comparison-summary", "children"),
+     Output("scenario-comparison-chart", "figure")],
+    [Input("stored-solution", "children"),
+     Input("compare-scenarios-btn", "n_clicks")]
+)
+def update_scenario_comparison(stored_solution, compare_clicks):
+    """Compare baseline vs optimized scenarios"""
+    artefacts = prepare_scenario_comparison(stored_solution)
+    return artefacts["summary"], artefacts["figure"]
+
+
+@app.callback(
+    [Output("scenario-comparison-modal", "is_open"),
+     Output("modal-scenario-summary", "children"),
+     Output("modal-scenario-chart", "figure"),
+     Output("modal-scenario-meta", "children")],
+    [Input("compare-scenarios-btn", "n_clicks"),
+     Input("scenario-modal-close", "n_clicks")],
+    [State("scenario-comparison-modal", "is_open"),
+     State("stored-solution", "children")],
+    prevent_initial_call=True
+)
+def toggle_scenario_modal(open_clicks, close_clicks, is_open, stored_solution):
+    """Open a modal snapshot of the scenario comparison dashboard."""
+    ctx = callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+
+    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
+
+    if trigger_id == "compare-scenarios-btn" and open_clicks:
+        artefacts = prepare_scenario_comparison(stored_solution)
+        return True, artefacts["summary"], artefacts["figure"], artefacts["meta"]
+
+    if trigger_id == "scenario-modal-close" and close_clicks:
+        return False, dash.no_update, dash.no_update, dash.no_update
+
+    raise PreventUpdate
 
 @app.callback(
     Output("cost-breakdown-chart", "figure"),
@@ -2921,10 +3080,15 @@ def run_server(debug: Optional[bool] = None, port=5006, host='127.0.0.1'):
     print(f"Dashboard available at: http://{host}:{port}/")
     print("Loading modules and initializing predictive components...")
     print(f"Debug mode: {'ON' if debug else 'OFF'}")
+    print(f"Deterministic seed in use: {BASE_RANDOM_SEED}")
     
     # Initialize ML model (guard against duplicate execution under any reloader)
     if os.environ.get("WERKZEUG_RUN_MAIN") in (None, "true"):
+        set_global_seed(BASE_RANDOM_SEED, quiet=True)
+        reseed_for_phase("eta_model_training", quiet=True)
         eta_predictor.train_stub_model()
+        # Restore base seed for downstream callbacks
+        set_global_seed(BASE_RANDOM_SEED, quiet=True)
     
     print(f"Server ready at http://{host}:{port}/")
     print("Tip: Leave this terminal open while the dashboard is running.")

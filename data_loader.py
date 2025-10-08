@@ -7,6 +7,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import io
 import base64
+import re
 
 class DataLoader:
     """Handles data loading, validation, and toy dataset generation"""
@@ -32,6 +33,8 @@ class DataLoader:
             'eta_day': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             'port_id': ['HALDIA', 'PARADIP', 'VIZAG', 'HALDIA', 'PARADIP', 
                        'VIZAG', 'HALDIA', 'PARADIP', 'VIZAG', 'HALDIA'],
+            'secondary_port_id': [None, 'HALDIA', 'HALDIA', None, 'HALDIA',
+                                  'HALDIA', None, 'HALDIA', 'HALDIA', None],
             'demurrage_rate': [5000, 6000, 4500, 5500, 5200, 6200, 4800, 5800, 5100, 5900],
             'cargo_grade': ['IRON_ORE', 'COAL', 'IRON_ORE', 'COAL', 'IRON_ORE', 
                            'COAL', 'IRON_ORE', 'COAL', 'IRON_ORE', 'COAL']
@@ -101,6 +104,23 @@ class DataLoader:
                     errors.append("vessels: cargo_mt must be positive")
                 if 'eta_day' in df.columns and (df['eta_day'] < 0).any():
                     errors.append("vessels: eta_day must be non-negative")
+                if 'secondary_port_id' in df.columns:
+                    secondary_series = df['secondary_port_id'].dropna().astype(str).str.strip()
+                    if not secondary_series.empty:
+                        port_ids = set(data.get('ports', pd.DataFrame()).get('port_id', []))
+                        bad_values = []
+                        for entry in secondary_series:
+                            if not entry:
+                                continue
+                            tokens = [tok.strip() for tok in re.split(r'[|;,]+', entry) if tok.strip()]
+                            for token in tokens:
+                                token = token.upper()
+                                if token not in port_ids:
+                                    bad_values.append(token)
+                        if bad_values:
+                            errors.append(
+                                f"vessels: secondary_port_id contains unknown ports {sorted(set(bad_values))}"
+                            )
             
             elif dataset_name == 'ports':
                 if 'daily_capacity_mt' in df.columns and (df['daily_capacity_mt'] <= 0).any():

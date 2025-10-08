@@ -9,6 +9,7 @@ from typing import Dict, List, Tuple, Optional
 from utils import CostCalculator, ETAPredictor
 import time
 import math
+import re
 
 class MILPOptimizer:
     """Mixed Integer Linear Programming optimizer for logistics dispatch"""
@@ -26,20 +27,81 @@ class MILPOptimizer:
         self.plant_lookup = self.plants_df.set_index('plant_id').to_dict('index')
         self.vessel_lookup = self.vessels_df.set_index('vessel_id').to_dict('index')
 
+        self.secondary_port_penalty_per_mt = 50.0
+        self.secondary_port_bias_days = 0.25
+
+        self.vessel_allowed_ports: Dict[str, List[str]] = {}
+        self.primary_port_map: Dict[str, str] = {}
+        self.port_daily_throughput: Dict[str, float] = {}
+        self.vessel_service_day_limits: Dict[str, Dict[str, int]] = {}
+
+        for vessel_id, vessel_data in self.vessel_lookup.items():
+            primary_port = str(vessel_data['port_id']).strip()
+            allowed_ports = self._parse_allowed_ports(vessel_data, primary_port)
+            self.vessel_allowed_ports[vessel_id] = allowed_ports
+            self.primary_port_map[vessel_id] = primary_port
+
+        for port_id, port_data in self.port_lookup.items():
+            daily_capacity = float(port_data.get('daily_capacity_mt', 0.0) or 0.0)
+            rakes_available = float(port_data.get('rakes_available_per_day', 0.0) or 0.0)
+            rake_capacity = rakes_available * self.rake_capacity_mt
+            throughput = min(daily_capacity, rake_capacity) if daily_capacity and rake_capacity else max(daily_capacity, rake_capacity)
+            self.port_daily_throughput[port_id] = max(1.0, throughput)
+
+        for vessel_id, vessel_data in self.vessel_lookup.items():
+            cargo_mt = float(vessel_data.get('cargo_mt', 0.0) or 0.0)
+            self.vessel_service_day_limits[vessel_id] = {}
+            allowed_ports = self.vessel_allowed_ports.get(vessel_id, [self.primary_port_map.get(vessel_id)])
+            for port_id in allowed_ports:
+                port_throughput = self.port_daily_throughput.get(port_id, cargo_mt if cargo_mt > 0 else 1.0)
+                if port_throughput <= 0:
+                    service_days = self.time_horizon
+                else:
+                    service_days = int(math.ceil(cargo_mt / port_throughput))
+
+                # Provide a small scheduling buffer while respecting horizon limits
+                buffered_days = min(self.time_horizon, max(1, service_days + 1))
+                self.vessel_service_day_limits[vessel_id][port_id] = buffered_days
+
         # Predict inherent pre-berthing delays for realism (in days)
         self.eta_predictor = ETAPredictor()
-        self.predicted_delay_days: Dict[str, float] = {}
+        self.predicted_delay_days: Dict[str, Dict[str, float]] = {}
         for vessel_id, vessel_data in self.vessel_lookup.items():
-            try:
-                delay_hours = self.eta_predictor.predict_delay(
-                    vessel_id=vessel_id,
-                    port_id=vessel_data['port_id'],
-                    base_eta=float(vessel_data['eta_day'])
-                )
-                self.predicted_delay_days[vessel_id] = max(0.0, delay_hours / 24.0)
-            except Exception:
-                self.predicted_delay_days[vessel_id] = 0.0
+            eta_day = float(vessel_data['eta_day'])
+            port_delay_map: Dict[str, float] = {}
+            for port_id in self.vessel_allowed_ports[vessel_id]:
+                try:
+                    delay_hours = self.eta_predictor.predict_delay(
+                        vessel_id=vessel_id,
+                        port_id=port_id,
+                        base_eta=eta_day
+                    )
+                    port_delay_map[port_id] = max(0.0, delay_hours / 24.0)
+                except Exception:
+                    port_delay_map[port_id] = 0.0
+            self.predicted_delay_days[vessel_id] = port_delay_map
         
+    def _parse_allowed_ports(self, vessel_row: Dict, primary_port: str) -> List[str]:
+        allowed = [primary_port]
+        secondary_value = vessel_row.get('secondary_port_id')
+        if secondary_value is None:
+            return allowed
+
+        if isinstance(secondary_value, (float, int)) and pd.isna(secondary_value):
+            return allowed
+
+        if isinstance(secondary_value, str):
+            tokens = [tok.strip().upper() for tok in re.split(r'[|;,]+', secondary_value) if tok.strip()]
+        elif isinstance(secondary_value, (list, tuple, set)):
+            tokens = [str(tok).strip().upper() for tok in secondary_value if str(tok).strip()]
+        else:
+            tokens = [str(secondary_value).strip().upper()]
+
+        for token in tokens:
+            if token and token not in allowed and token in self.port_lookup:
+                allowed.append(token)
+        return allowed
+
     def build_milp_model(self, solver_time_limit: int = 300) -> Tuple[pulp.LpProblem, Dict]:
         """Build the MILP model for rake dispatch optimization"""
         
@@ -66,6 +128,17 @@ class MILPOptimizer:
                                  [(v, p, t) for v in vessels for p in ports for t in time_periods],
                                  cat='Binary')
         
+        # u[v,p] = 1 if vessel v chooses port p for discharge
+        vessel_port_pairs = []
+        for v in vessels:
+            allowed_ports = self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)])
+            for p in allowed_ports:
+                vessel_port_pairs.append((v, p))
+
+        u = pulp.LpVariable.dicts("vessel_port_choice",
+                                 vessel_port_pairs,
+                                 cat='Binary')
+
         # z[p,pl,t] = number of rakes from port p to plant pl in period t
         z = pulp.LpVariable.dicts("rake_assignment",
                                  [(p, pl, t) for p in ports for pl in plants for t in time_periods],
@@ -87,7 +160,16 @@ class MILPOptimizer:
         
         total_demurrage = pulp.lpSum([demurrage_cost[v] for v in vessels])
         
-        prob += port_handling_cost + rail_transport_cost + total_demurrage
+        secondary_preference_cost = pulp.lpSum([
+            x[v, p, pl, t] * self.secondary_port_penalty_per_mt
+            for v in vessels
+            for p in ports
+            if p in self.vessel_allowed_ports.get(v, []) and p != self.primary_port_map.get(v)
+            for pl in plants
+            for t in time_periods
+        ])
+
+        prob += port_handling_cost + rail_transport_cost + total_demurrage + secondary_preference_cost
         
         # Constraints
         
@@ -99,38 +181,54 @@ class MILPOptimizer:
         
         # 2. Vessel can only berth at its designated port
         for v in vessels:
-            vessel_port = self.vessel_lookup[v]['port_id']
+            allowed_ports = self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)])
+            if allowed_ports:
+                prob += pulp.lpSum([u[v, p] for p in allowed_ports]) == 1
+
             for p in ports:
-                if p != vessel_port:
+                if p not in allowed_ports:
                     for t in time_periods:
                         prob += y[v, p, t] == 0
+                else:
+                    for t in time_periods:
+                        prob += y[v, p, t] <= u[v, p]
         
         # 3. Vessel can berth only after ETA
         for v in vessels:
             vessel_eta = float(self.vessel_lookup[v]['eta_day'])
-            vessel_port = self.vessel_lookup[v]['port_id']
-            for t in time_periods:
-                if t < vessel_eta:
-                    prob += y[v, vessel_port, t] == 0
+            allowed_ports = self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)])
+            for p in allowed_ports:
+                for t in time_periods:
+                    if t < vessel_eta:
+                        prob += y[v, p, t] == 0
         
-        # 4. Vessel berths at most once
+        # 4. Vessel berthing schedule limits and exclusivity
         for v in vessels:
-            vessel_port = self.vessel_lookup[v]['port_id']
-            prob += pulp.lpSum([y[v, vessel_port, t] for t in time_periods]) <= 1
+            allowed_ports = self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)])
+            if not allowed_ports:
+                continue
+
+            for p in allowed_ports:
+                service_limit = self.vessel_service_day_limits.get(v, {}).get(p, 1)
+                prob += pulp.lpSum([y[v, p, t] for t in time_periods]) <= service_limit * u[v, p]
+
+            for t in time_periods:
+                prob += pulp.lpSum([y[v, p, t] for p in allowed_ports]) <= 1
         
         # 5. Cargo flow only when vessel berths
         for v in vessels:
-            vessel_port = self.vessel_lookup[v]['port_id']
             vessel_cargo = self.vessel_lookup[v]['cargo_mt']
-            for pl in plants:
-                for t in time_periods:
-                    prob += x[v, vessel_port, pl, t] <= vessel_cargo * y[v, vessel_port, t]
+            allowed_ports = self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)])
+            for p in allowed_ports:
+                for pl in plants:
+                    for t in time_periods:
+                        prob += x[v, p, pl, t] <= vessel_cargo * y[v, p, t]
 
         # 5b. Block cargo flows from non-designated ports entirely
         for v in vessels:
-            vessel_port = self.vessel_lookup[v]['port_id']
+            allowed_ports = self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)])
             for p in ports:
-                if p == vessel_port:
+                if p in allowed_ports:
                     continue
                 for pl in plants:
                     for t in time_periods:
@@ -160,15 +258,15 @@ class MILPOptimizer:
         # 10. Demurrage cost calculation (simplified)
         for v in vessels:
             vessel_eta = float(self.vessel_lookup[v]['eta_day'])
-            vessel_port = self.vessel_lookup[v]['port_id']
             demurrage_rate = float(self.vessel_lookup[v]['demurrage_rate'])
-            inherent_delay = self.predicted_delay_days.get(v, 0.0)
 
             delay_terms = []
-            for t in time_periods:
-                effective_delay = max(0.0, (t + inherent_delay) - vessel_eta)
-                if effective_delay > 0:
-                    delay_terms.append(demurrage_rate * effective_delay * y[v, vessel_port, t])
+            for p in self.vessel_allowed_ports.get(v, [self.primary_port_map.get(v)]):
+                inherent_delay = self.predicted_delay_days.get(v, {}).get(p, 0.0)
+                for t in time_periods:
+                    effective_delay = max(0.0, (t + inherent_delay) - vessel_eta)
+                    if effective_delay > 0:
+                        delay_terms.append(demurrage_rate * effective_delay * y[v, p, t])
 
             if delay_terms:
                 prob += demurrage_cost[v] >= pulp.lpSum(delay_terms)
@@ -178,6 +276,7 @@ class MILPOptimizer:
         variables = {
             'cargo_flow': x,
             'vessel_berth': y, 
+            'vessel_port_choice': u,
             'rake_assignment': z,
             'demurrage_cost': demurrage_cost
         }
@@ -276,7 +375,7 @@ class MILPOptimizer:
                             continue
 
                         scheduled_day = int(t)
-                        predicted_delay = float(self.predicted_delay_days.get(v, 0.0))
+                        predicted_delay = float(self.predicted_delay_days.get(v, {}).get(p, 0.0))
                         planned_eta = float(self.vessel_lookup[v]['eta_day'])
                         actual_berth_time = float(scheduled_day + predicted_delay)
 
@@ -310,50 +409,69 @@ class MILPOptimizer:
         
         # Simple assignment: each vessel to closest plant with matching requirements
         for _, vessel in vessels_sorted.iterrows():
-            vessel_port = vessel['port_id']
+            vessel_id = vessel['vessel_id']
+            primary_port = vessel['port_id']
             cargo_grade = vessel['cargo_grade']
             cargo_mt = vessel['cargo_mt']
             eta = float(vessel['eta_day'])
-            predicted_delay = self.predicted_delay_days.get(vessel['vessel_id'], 0.0)
-            
+
             # Find plants that can accept this cargo type
             compatible_plants = self.plants_df[
                 self.plants_df['quality_requirements'] == cargo_grade
             ]
             
-            if not compatible_plants.empty:
-                # Choose plant with highest demand (baseline doesn't optimize)
-                target_plant = compatible_plants.loc[compatible_plants['daily_demand_mt'].idxmax()]
-                
-                # Baseline: vessels may have to wait if port is busy (sequential berthing)
-                # This creates realistic delays and demurrage costs
-                if vessel_port not in port_utilization:
-                    port_utilization[vessel_port] = eta
+            if compatible_plants.empty:
+                continue
 
+            target_plant = compatible_plants.loc[compatible_plants['daily_demand_mt'].idxmax()]
+
+            allowed_ports = self.vessel_allowed_ports.get(vessel_id, [primary_port])
+            best_choice = None
+            best_score = None
+
+            for candidate_port in allowed_ports:
+                predicted_delay = self.predicted_delay_days.get(vessel_id, {}).get(candidate_port, 0.0)
                 arrival_with_delay = eta + predicted_delay
-                available_time = port_utilization[vessel_port]
-                actual_berth_time = max(arrival_with_delay, available_time)
-                
-                # Assume port takes 1-2 days to handle cargo (baseline is slower)
-                port_handling_days = 1.5  # Baseline is less efficient
-                port_utilization[vessel_port] = actual_berth_time + port_handling_days
+                port_available = port_utilization.get(candidate_port, eta)
+                actual_start = max(arrival_with_delay, port_available)
+                bias = 0.0 if candidate_port == primary_port else self.secondary_port_bias_days
+                score = actual_start + bias
 
-                scheduled_day = int(math.ceil(actual_berth_time))
-                
-                assignment = {
-                    'vessel_id': vessel['vessel_id'],
-                    'port_id': vessel_port,
-                    'plant_id': target_plant['plant_id'],
-                    'time_period': scheduled_day,
-                    'scheduled_day': scheduled_day,
-                    'cargo_mt': cargo_mt,
-                    'berth_time': actual_berth_time,
-                    'actual_berth_time': actual_berth_time,
-                    'planned_berth_time': eta,
-                    'predicted_delay_days': predicted_delay,
-                    'rakes_required': int(np.ceil(cargo_mt / self.rake_capacity_mt))
-                }
-                assignments.append(assignment)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_choice = {
+                        'port': candidate_port,
+                        'predicted_delay': predicted_delay,
+                        'actual_start': actual_start
+                    }
+
+            if not best_choice:
+                continue
+
+            chosen_port = best_choice['port']
+            actual_berth_time = best_choice['actual_start']
+            predicted_delay = best_choice['predicted_delay']
+
+            # Assume port takes 1-2 days to handle cargo (baseline is slower)
+            port_handling_days = 1.5  # Baseline is less efficient
+            port_utilization[chosen_port] = actual_berth_time + port_handling_days
+
+            scheduled_day = int(math.ceil(actual_berth_time))
+
+            assignment = {
+                'vessel_id': vessel_id,
+                'port_id': chosen_port,
+                'plant_id': target_plant['plant_id'],
+                'time_period': scheduled_day,
+                'scheduled_day': scheduled_day,
+                'cargo_mt': cargo_mt,
+                'berth_time': actual_berth_time,
+                'actual_berth_time': actual_berth_time,
+                'planned_berth_time': eta,
+                'predicted_delay_days': predicted_delay,
+                'rakes_required': int(np.ceil(cargo_mt / self.rake_capacity_mt))
+            }
+            assignments.append(assignment)
         
         # Calculate baseline costs (now includes demurrage from delays)
         baseline_cost = self._calculate_assignment_cost(assignments)
@@ -396,6 +514,10 @@ class MILPOptimizer:
             delay_days = max(0, float(berth_time) - vessel_eta) if berth_time is not None else 0
             demurrage_cost = delay_days * demurrage_rate
             
-            total_cost += port_cost + rail_cost + demurrage_cost
+            secondary_penalty = 0.0
+            if port_id != self.primary_port_map.get(vessel_id):
+                secondary_penalty = cargo_mt * self.secondary_port_penalty_per_mt
+
+            total_cost += port_cost + rail_cost + demurrage_cost + secondary_penalty
         
         return total_cost
